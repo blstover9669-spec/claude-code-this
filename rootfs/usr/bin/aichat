@@ -237,6 +237,14 @@ def show_file(n):
     if b"\0" in data[:4096]: info("%s is a binary file (%d bytes)." % (os.path.basename(p), len(data))); return
     print(data.decode("utf-8", "replace"))
 
+# Runs a .py app as __main__ but turns Ctrl+C into a quiet exit (code 130) instead of a traceback.
+PY_LAUNCH = ("import runpy, sys\n"
+             "sys.argv = sys.argv[1:]\n"
+             "try:\n"
+             "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+             "except KeyboardInterrupt:\n"
+             "    sys.exit(130)\n")
+
 def emulated_cpu():
     """True when AI OS itself runs on a software-emulated CPU (QEMU without KVM). Such CPUs can claim
     virtualization support, but KVM on top of them crashes, so VMs must use plain emulation there."""
@@ -257,7 +265,7 @@ def run_app(arg):
     src = name
     env = dict(os.environ)
     if ext == ".sh": cmd = ["sh", p] + args
-    elif ext == ".py": cmd = ["python3", p] + args
+    elif ext == ".py": cmd = ["python3", "-c", PY_LAUNCH, p] + args
     elif ext == ".c":
         exe, e = compile_c(p)
         if not exe: return ("Compiling %s failed:\n%s" % (name, e), name)
@@ -314,8 +322,10 @@ def run_app(arg):
         show_file(name); return None
     info("--- running %s (Ctrl+C stops it) ---" % name)
     rc, tail = run_fg(cmd, env)
+    if rc in (130, -signal.SIGINT):
+        info("--- %s stopped (Ctrl+C) ---" % name); return None
     print(col("gr" if rc == 0 else "re", "--- %s exited with code %d ---" % (name, rc)))
-    if rc not in (0, 130, -signal.SIGINT):
+    if rc != 0:
         return ("Running %s exited with code %d. Error output:\n%s" % (name, rc, tail.strip()[-3000:] or "(none)"), src)
     return None
 
