@@ -45,6 +45,22 @@ ask the AI to write the program in C instead.
   `dd if=ai-os.iso of=/dev/sdX bs=4M`, then boot from it. Turn off Secure Boot in the
   firmware settings (the boot loader isn't signed). It boots on BIOS and UEFI.
 - Networking: wired Ethernet and USB tethering from a phone work right away; for Wi-Fi use `/wifi`.
+  In a VM there is nothing to set up: the VM's NAT adapter uses the host's connection, Wi-Fi included.
+
+**VirtualBox in short**: Type *Linux*, Version *Other Linux (64-bit)*, Base Memory 2048 MB,
+no hard disk, `ai-os.iso` in the optical drive, network adapter on NAT. Tick
+*Skip Unattended Installation* if the new-VM wizard offers it.
+
+Starting up, AI OS shows a counter while the boot menu reads the system into memory, then a
+loading bar with each step (drivers, network, clock) until the chat appears. On a normal PC
+or VM that takes 10–20 seconds. If it ever stops:
+
+- pick **AI OS (show boot messages)** in the boot menu to see where it stops;
+- "needs a 64-bit processor": set the VM's version to a 64-bit one, or turn on VT-x/AMD-V
+  in the PC's BIOS if VirtualBox only offers 32-bit versions;
+- "needs more RAM": raise the VM's memory to 2 GB;
+- a turtle icon in VirtualBox's status bar means it runs without hardware virtualization
+  (often because Hyper-V is on in Windows). Everything still works, only much slower.
 
 Everything runs from RAM. Nothing is written to your disks, and your apps are gone after a
 reboot unless you pack them into a new ISO with `/iso`.
@@ -58,7 +74,7 @@ and never commit a key to this repository.
 
 ## Building the ISO
 
-Needs a Linux machine with root, `curl`, `cpio`, `xz`, `xorriso`, `mtools` and GRUB
+Needs a Linux machine with root, `curl`, `cpio`, `zstd`, `xorriso`, `mtools` and GRUB
 (`grub-pc-bin` and `grub-efi-amd64-bin` on Debian/Ubuntu).
 
 ```

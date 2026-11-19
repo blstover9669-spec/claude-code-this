@@ -330,17 +330,45 @@ def run_app(arg):
     return None
 
 # ---------------------------------------------------------------- ISO builder
+# The boot menu for ISOs made with /iso. build.sh puts the ISO's own grub.cfg at /boot/grub.cfg,
+# which is used when present; this copy is the fallback and should match grub/grub.cfg.
 GRUB_CFG = """set timeout=3
 set default=0
-serial --unit=0 --speed=115200
-terminal_input console serial
-terminal_output console serial
+if serial --unit=0 --speed=115200; then
+  terminal_input console serial
+  terminal_output console serial
+fi
+# AI OS is 64-bit only: say so plainly instead of failing with a blank screen
+if cpuid -l; then set aios_cpu_ok=1; fi
+if [ "$aios_cpu_ok" != "1" ]; then
+  clear
+  echo "AI OS needs a 64-bit processor, and this PC or VM is running as 32-bit."
+  echo ""
+  echo "VirtualBox: power the VM off, open Settings > General > Basic and set"
+  echo "Version to 'Other Linux (64-bit)'. If only 32-bit versions are listed,"
+  echo "turn on virtualization (Intel VT-x or AMD-V) in your PC's BIOS settings."
+  echo ""
+  echo "Press Enter to restart."
+  read
+  reboot
+fi
+# show how far loading has got while the system is read from the disc or USB stick
+# (the commands the menu uses load first, so only the system files get a counter)
+insmod echo
+insmod linux
+insmod progress
 menuentry "AI OS" {
-  linux /boot/vmlinuz quiet loglevel=3
+  echo "Loading AI OS..."
+  linux /boot/vmlinuz quiet loglevel=3 edd=off
   initrd /boot/initramfs
 }
 menuentry "AI OS (serial console)" {
-  linux /boot/vmlinuz console=tty0 console=ttyS0,115200 loglevel=3
+  linux /boot/vmlinuz console=tty0 console=ttyS0,115200 loglevel=3 edd=off
+  initrd /boot/initramfs
+}
+menuentry "AI OS (show boot messages)" {
+  echo "Loading AI OS with all boot messages shown..."
+  linux /boot/vmlinuz loglevel=7 edd=off
   initrd /boot/initramfs
 }
 """
@@ -375,14 +403,18 @@ def make_iso(arg):
         initrd = os.path.join(iso, "boot/initramfs")
         # etc/wpa_supplicant holds the Wi-Fi password: never copy it into a new ISO
         prune = " ".join("-path ./%s -prune -o" % d for d in ("proc", "sys", "dev", "tmp", "run", "root/apps",
-                                                               "etc/wpa_supplicant"))
+                                                               "etc/wpa_supplicant", ".aios-complete"))
+        # the marker /init checks goes in the archive that is unpacked last
+        open(os.path.join(extra, ".aios-complete"), "w").close()
         # zstd packs ~30% smaller than gzip, so the new ISO needs less RAM to unpack when it boots
         comp = "zstd -q -T0 -12" if shutil.which("zstd") else "gzip -1"
         sh = ("set -e; { (cd / && find . -xdev %s -print | cpio -o -H newc 2>/dev/null); "
               "(cd '%s' && find . | cpio -o -H newc 2>/dev/null); } | %s > '%s'" % (prune, extra, comp, initrd))
         if subprocess.call(["sh", "-c", sh]) != 0: err("Packing failed."); return
         shutil.copy2("/boot/vmlinuz", iso + "/boot/vmlinuz")
-        with open(iso + "/boot/grub/grub.cfg", "w") as fh: fh.write(GRUB_CFG)
+        try: cfg = open("/boot/grub.cfg").read()  # the boot menu this ISO itself was built with
+        except OSError: cfg = GRUB_CFG
+        with open(iso + "/boot/grub/grub.cfg", "w") as fh: fh.write(cfg)
         info("[2/3] system image %d MB" % (os.path.getsize(initrd) >> 20))
         info("[3/3] writing ISO...")
         dest = os.path.join(APPS, out)
@@ -477,7 +509,7 @@ def wifi_cmd(rest):
     elif rc == 0: info("Online. Talk away!")
 
 def banner():
-    if sys.stdout.isatty(): sys.stdout.write("\033[H\033[2J")
+    if sys.stdout.isatty(): sys.stdout.write("\033[?25h\033[H\033[2J")  # cursor back on (boot hid it)
     print(C["ma"] + C["b"] + r"""
      _    ___    ___  ____
     / \  |_ _|  / _ \/ ___|
@@ -498,12 +530,19 @@ def default_route():
 def wait_for_network(secs=20):
     if not os.path.exists("/proc/net/route") or default_route(): return
     if wired_ifaces():  # a cable or VM adapter may be getting its address: wait a little
-        sys.stdout.write(col("dim", "connecting to the network")); sys.stdout.flush()
-        for _ in range(secs):
-            time.sleep(1)
-            if default_route(): print(col("gr", " online")); return
-            sys.stdout.write(col("dim", ".")); sys.stdout.flush()
-        print()
+        tty = sys.stdout.isatty()
+        steps = secs * 2
+        for t in range(steps):
+            if default_route():
+                if tty: sys.stdout.write("\r\033[K")
+                print(col("gr", "Connected to the network.")); return
+            if tty:  # same loading bar as the boot screen
+                n = (t + 1) * 30 // steps
+                sys.stdout.write("\r   " + C["ma"] + C["b"] + "█" * n + C["r"] + "\033[37m" + "░" * (30 - n)
+                                 + C["r"] + "  connecting to the network\033[K")
+                sys.stdout.flush()
+            time.sleep(0.5)
+        if tty: sys.stdout.write("\r\033[K")
     if wifi_iface():
         info("Not online yet. Type /wifi to pick a Wi-Fi network (or plug in a cable).")
     else:

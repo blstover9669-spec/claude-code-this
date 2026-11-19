@@ -1,16 +1,21 @@
 #!/bin/sh
 # PID 1: mount basics, write inittab, hand over to busybox init.
-if [ ! -d /etc ] || [ ! -x /usr/bin/aichat ] || [ ! -x /usr/bin/python3 ]; then
+if [ ! -e /.aios-complete ] || [ ! -x /usr/bin/aichat ] || [ ! -x /sbin/init ]; then
   # The kernel ran out of memory while unpacking the system into RAM and stopped half way.
+  # build.sh puts this file and the shell it needs first in the archive, so this still runs,
+  # and /.aios-complete last, so it is missing whenever the unpacking stopped early.
   echo
   echo "AI OS could not unpack itself into memory: this computer or VM needs more RAM."
   echo "Give it at least 1 GB (2 GB or more recommended) and start it again."
+  echo "In VirtualBox: Settings > System > Motherboard > Base Memory = 2048 MB."
   echo "Powering off in 60 seconds."
   sleep 60; poweroff -f; sleep 3600
 fi
 mount -t proc proc /proc; mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null; mkdir -p /dev/pts /dev/shm; mount -t devpts devpts /dev/pts
 mount -t tmpfs tmp /tmp; mount -t tmpfs run /run
+/sbin/ai-progress --title
+/sbin/ai-progress 10 "starting"
 {
   echo '::sysinit:/sbin/ai-sysinit'
   echo 'tty1::respawn:/usr/bin/aichat'

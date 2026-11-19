@@ -28,6 +28,9 @@ $APK --root "$R" --initdb -U add \
 rm -rf "$R/usr/lib/python3"*/test "$R/usr/lib/python3"*/ensurepip "$R/usr/lib/python3"*/idlelib \
        "$R/usr/lib/python3"*/tkinter "$R/var/cache/apk/"*
 find "$R/usr/lib" -name __pycache__ -prune -exec rm -rf {} +
+# precompile Python's standard library: without it, every boot spends seconds (minutes in a slow VM)
+# compiling the modules the chat imports before it can show anything
+PYTHONHASHSEED=0 chroot "$R" /usr/bin/python3 -m compileall -q -j 0 -x '/(test|tests|idlelib|turtledemo)/' /usr/lib >/dev/null
 # qemu firmware we do not need (keeps BIOS + the default VGA ROMs)
 find "$R/usr/share/qemu" -name '*.fd' -o -name 'edk2*' -o -name '*-s390*' -o -name 'u-boot*' -o -name '*.dtb' 2>/dev/null | xargs rm -rf
 
@@ -96,9 +99,17 @@ KEY=${GROQ_API_KEY:-$( [ -f groq.key ] && cat groq.key || true )}
 if [ -n "$KEY" ]; then mkdir -p "$R/etc/ai-os"; printf '%s\n' "$KEY" > "$R/etc/ai-os/key"; chmod 600 "$R/etc/ai-os/key"; fi
 echo ai-os > "$R/etc/hostname"
 mkdir -p "$R/root/apps"
+cp grub/grub.cfg "$R/boot/grub.cfg"   # /iso gives the ISOs it makes this same boot menu
 
 # 5. initramfs + ISO
-(cd "$R" && find . | cpio -o -H newc --quiet | xz -T0 -6 --check=crc32) > "$ISO/boot/initramfs"
+# The files /init needs to print "needs more RAM" go first: when the kernel runs out of memory
+# while unpacking, it stops part way through the archive, and these are already in place.
+EARLY="./init ./bin ./bin/busybox ./bin/sh ./bin/echo ./bin/sleep ./lib ./lib/ld-musl-x86_64.so.1 ./sbin ./sbin/poweroff"
+# zstd unpacks about 10x faster than xz: that unpacking is most of the wait between the boot menu and the chat
+# .aios-complete goes last: /init only finds it when the whole system was unpacked
+touch "$R/.aios-complete"
+(cd "$R" && { printf '%s\n' . $EARLY; find . | grep -vxF -e . -e ./.aios-complete $(printf -- '-e %s ' $EARLY); \
+  echo ./.aios-complete; } | cpio -o -H newc --quiet | zstd -q -T0 -19) > "$ISO/boot/initramfs"
 cp grub/grub.cfg "$ISO/boot/grub/grub.cfg"
 grub-mkrescue -o out/ai-os.iso "$ISO" -- -volid AIOS 2>/dev/null
 ls -lh out/ai-os.iso

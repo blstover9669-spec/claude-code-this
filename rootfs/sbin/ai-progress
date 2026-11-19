@@ -1,0 +1,30 @@
+#!/bin/sh
+# ai-progress PERCENT LABEL...   draws AI OS's boot loading bar on the screen
+# ai-progress --title            clears the screen and draws the heading above the bar
+# Writes to the main screen (tty1) and, when the serial-console boot entry is used, to ttyS0 too.
+
+targets=${AIP_TARGETS:-}  # ai-sysinit works this out once, so each redraw stays quick
+if [ -z "$targets" ]; then
+	targets="/dev/tty1"
+	grep -q 'console=ttyS0' /proc/cmdline 2>/dev/null && targets="$targets /dev/ttyS0"
+fi
+
+out() { for t in $targets; do [ -w "$t" ] && printf '%b' "$1" > "$t" 2>/dev/null; done; }
+
+if [ "$1" = "--title" ]; then
+	out '\033[?25l\033[2J\033[H\n\n   \033[1;35mAI OS\033[0m is starting\n\n'  # cursor hidden until the chat
+	exit 0
+fi
+
+p=${1:-0}; shift
+[ "$p" -gt 100 ] 2>/dev/null && p=100
+label="$*"
+width=30
+n=$((p * width / 100))
+fill=""; rest=""; i=0
+while [ "$i" -lt "$width" ]; do
+	if [ "$i" -lt "$n" ]; then fill="$fill█"; else rest="$rest░"; fi
+	i=$((i + 1))
+done
+# \r returns to the start of the line, \033[K clears what an older, longer label left behind
+out "\r   \033[1;35m$fill\033[0;37m$rest\033[0m $(printf '%3d' "$p")%  $label\033[K"
