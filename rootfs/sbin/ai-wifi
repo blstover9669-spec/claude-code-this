@@ -1,0 +1,265 @@
+#!/bin/sh
+# ai-wifi - small Wi-Fi helper for AI OS (wpa_supplicant + udhcpc). aichat's /wifi command calls it.
+#
+#   ai-wifi iface                print the first wireless interface; exit 1 if there is none
+#   ai-wifi scan                 one network per line, strongest first:  SIGNAL_dBm<TAB>SECURITY<TAB>SSID
+#   ai-wifi connect SSID [PASS]  join a network: open without PASS, else WPA2/WPA3-Personal
+#   ai-wifi status               key=value lines (iface, state, ssid, ip); exit 0 only when connected with an IPv4
+#   ai-wifi disconnect           leave the network and stop Wi-Fi
+#
+# connect exit codes: 0 connected, 1 usage / no adapter / radio off, 2 network not found,
+#                     3 wrong password (or the network refused us), 4 joined but no IP address (DHCP), 5 other failure
+# Testing hooks: AIWIFI_IFACE (force the interface), AIWIFI_CONF (config path),
+#                AIWIFI_DRYRUN=1 (connect only prints the config it would use; nothing is started).
+
+CONF=${AIWIFI_CONF:-/etc/wpa_supplicant/wpa_supplicant.conf}
+CTRL=/run/wpa_supplicant
+TIMEOUT=${AIWIFI_TIMEOUT:-25}
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+say() { printf '%s\n' "$*"; }
+die() { c=$1; shift; say "$*" >&2; exit "$c"; }
+
+find_iface() {
+	if [ -n "${AIWIFI_IFACE:-}" ]; then say "$AIWIFI_IFACE"; return 0; fi
+	for n in /sys/class/net/*; do
+		if [ -d "$n/wireless" ] || [ -e "$n/phy80211" ]; then say "${n##*/}"; return 0; fi
+	done
+	return 1
+}
+
+# Wait a few seconds for the adapter: drivers load and firmware uploads right after boot.
+need_iface() {
+	i=0
+	while ! IF=$(find_iface); do
+		i=$((i + 1))
+		[ "$i" -ge 6 ] && die 1 "No Wi-Fi adapter found (or no driver/firmware for it). A network cable or USB phone tethering also works."
+		sleep 1
+	done
+}
+
+wpa() { wpa_cli -p "$CTRL" -i "$IF" "$@" 2>/dev/null; }
+
+hex() { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'; }
+
+radio_on() {
+	rfkill unblock wlan 2>/dev/null || rfkill unblock all 2>/dev/null
+	for r in /sys/class/rfkill/rfkill*; do
+		[ -e "$r/soft" ] && { echo 0 > "$r/soft"; } 2>/dev/null
+	done
+	for r in /sys/class/rfkill/rfkill*; do
+		[ "$(cat "$r/type" 2>/dev/null)" = wlan ] && [ "$(cat "$r/hard" 2>/dev/null)" = 1 ] &&
+			die 1 "Wi-Fi is switched off by a hardware switch or key (airplane mode). Turn it on and try again."
+	done
+	ip link set "$IF" up 2>/dev/null
+}
+
+base_conf() {
+	mkdir -p "${CONF%/*}"
+	printf 'ctrl_interface=%s\nupdate_config=0\n' "$CTRL" > "$CONF"
+}
+
+start_supplicant() {
+	[ "$(wpa ping)" = PONG ] && return 0
+	[ -s "$CONF" ] || base_conf
+	mkdir -p "$CTRL"
+	wpa_supplicant -B -i "$IF" -c "$CONF" -D nl80211,wext -P "/run/wpa_supplicant.$IF.pid" >/dev/null 2>&1 ||
+		die 5 "Could not start wpa_supplicant on $IF."
+	i=0
+	while [ "$(wpa ping)" != PONG ]; do
+		i=$((i + 1)); [ "$i" -ge 10 ] && die 5 "wpa_supplicant did not answer on $IF."
+		sleep 1
+	done
+}
+
+stop_dhcp() {
+	if [ -f "/run/udhcpc.$IF.pid" ]; then kill "$(cat "/run/udhcpc.$IF.pid")" 2>/dev/null; rm -f "/run/udhcpc.$IF.pid"; fi
+	for p in $(pgrep -f "udhcpc .*-i $IF( |\$)"); do kill "$p" 2>/dev/null; done
+}
+
+ipv4() { ip -4 -o addr show dev "$IF" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }'; }
+
+state() { wpa status | sed -n 's/^wpa_state=//p'; }
+
+# wpa_cli prints SSIDs printf-escaped (\" \\ \t \xNN ...); turn them back into the real bytes.
+unescape_awk='
+function hx(h,  d) { d = "0123456789abcdef"; h = tolower(h); return (index(d, substr(h, 1, 1)) - 1) * 16 + index(d, substr(h, 2, 1)) - 1 }
+function unesc(s,  out, c) {
+	out = ""
+	while (s != "") {
+		c = substr(s, 1, 1)
+		if (c == "\\" && length(s) >= 2) {
+			c = substr(s, 2, 1)
+			if (c == "x" && length(s) >= 4) { out = out sprintf("%c", hx(substr(s, 3, 2))); s = substr(s, 5); continue }
+			if (c == "n") c = "\n"; else if (c == "t") c = "\t"; else if (c == "r") c = "\r"; else if (c == "e") c = "\033"
+			out = out c; s = substr(s, 3); continue
+		}
+		out = out c; s = substr(s, 2)
+	}
+	return out
+}'
+
+scan_list() {
+	wpa scan_results | awk -F '\t' "$unescape_awk"'
+		NR > 1 && NF >= 5 {
+			ssid = $5; for (i = 6; i <= NF; i++) ssid = ssid "\t" $i
+			ssid = unesc(ssid)
+			if (ssid == "" || ssid ~ /^(\\x00)+$/) next
+			f = $4
+			if (f ~ /SAE/ && f ~ /PSK/) sec = "WPA2/WPA3"
+			else if (f ~ /SAE/) sec = "WPA3"
+			else if (f ~ /EAP/) sec = "Enterprise"
+			else if (f ~ /RSN-PSK|WPA2-PSK/) sec = "WPA2"
+			else if (f ~ /WPA-PSK/) sec = "WPA"
+			else if (f ~ /OWE/) sec = "OWE"
+			else if (f ~ /WEP/) sec = "WEP"
+			else sec = "open"
+			if (!(ssid in best) || $3 + 0 > best[ssid] + 0) { best[ssid] = $3; kind[ssid] = sec }
+		}
+		END { for (s in best) printf "%s\t%s\t%s\n", best[s], kind[s], s }' | sort -t "$(printf '\t')" -k1,1nr
+}
+
+cmd_scan() {
+	need_iface; radio_on; start_supplicant
+	before=$(wpa scan_results | awk 'NR > 1' | wc -l)
+	wpa scan >/dev/null
+	i=0
+	while [ "$i" -lt 12 ]; do
+		sleep 1; i=$((i + 1))
+		n=$(wpa scan_results | awk 'NR > 1' | wc -l)
+		if [ "$n" -gt 0 ] && { [ "$before" -eq 0 ] || [ "$i" -ge 4 ]; }; then break; fi
+	done
+	out=$(scan_list)
+	[ -n "$out" ] || die 2 "No Wi-Fi networks found."
+	say "$out"
+}
+
+ssid_seen() {
+	S="$1" wpa scan_results | S="$1" awk -F '\t' "$unescape_awk"'
+		NR > 1 && NF >= 5 { s = $5; for (i = 6; i <= NF; i++) s = s "\t" $i; if (unesc(s) == ENVIRON["S"]) found = 1 }
+		END { exit !found }'
+}
+
+cmd_connect() {
+	SSID=$1; PASS=${2-}
+	[ -n "$SSID" ] || die 1 "usage: ai-wifi connect SSID [PASSWORD]"
+	[ "$(printf '%s' "$SSID" | wc -c)" -le 32 ] || die 1 "A Wi-Fi name (SSID) is at most 32 bytes."
+	if [ -n "${AIWIFI_DRYRUN:-}" ]; then
+		IF=${AIWIFI_IFACE:-wlan0}; caps="WPA-PSK SAE"
+	else
+		need_iface; radio_on; start_supplicant
+		caps=$(wpa get_capability key_mgmt)
+	fi
+	sae=; case " $caps " in *" SAE "*) sae=1 ;; esac
+
+	# If the last scan saw this network, match its security (the user may not know it).
+	sec=
+	[ -z "${AIWIFI_DRYRUN:-}" ] && sec=$(scan_list | S="$SSID" awk -F '\t' '$3 == ENVIRON["S"] { print $2; exit }')
+	owe=
+	case $sec in
+		open|OWE)
+			[ -n "$PASS" ] && say "$SSID is an open network; no password needed."; PASS=
+			[ "$sec" = OWE ] && case " $caps " in *" OWE "*) owe=1 ;; esac ;;
+		Enterprise) die 1 "$SSID uses Enterprise (802.1X) login, which AI OS does not support." ;;
+		WEP) die 1 "$SSID uses old WEP security, which is not supported." ;;
+		WPA|WPA2) sae= ;;
+		WPA3) [ -n "$sae" ] || die 1 "$SSID needs WPA3, which this Wi-Fi adapter does not support." ;;
+	esac
+	case $sec in WPA*) [ -n "$PASS" ] || die 3 "$SSID needs a password: ai-wifi connect SSID PASSWORD" ;; esac
+
+	# Everything goes into the file as hex (ssid, psk, sae_password), so no quoting can break it.
+	psk=; km=NONE
+	if [ -n "$PASS" ]; then
+		plen=$(printf '%s' "$PASS" | wc -c)
+		if printf '%s' "$PASS" | grep -Eq '^[0-9A-Fa-f]{64}$'; then
+			psk=$PASS
+		elif [ "$plen" -ge 8 ] && [ "$plen" -le 63 ]; then
+			psk=$(wpa_passphrase "$SSID" "$PASS" | sed -n 's/^[[:space:]]*psk=\([0-9a-f]\{64\}\)$/\1/p')
+		fi
+		[ -n "$psk" ] || [ -n "$sae" ] || die 3 "A WPA2 password has 8 to 63 characters."
+		km=
+		[ -n "$psk" ] && km="WPA-PSK WPA-PSK-SHA256"
+		[ -n "$sae" ] && km="${km:+$km }SAE"
+	fi
+	[ -n "$owe" ] && km=OWE
+	mkdir -p "${CONF%/*}"
+	{
+		printf 'ctrl_interface=%s\nupdate_config=0\n' "$CTRL"
+		[ -n "$sae" ] && printf 'sae_pwe=2\n'
+		printf 'network={\n\tssid=%s\n\tscan_ssid=1\n\tkey_mgmt=%s\n' "$(hex "$SSID")" "$km"
+		[ -n "$owe" ] && printf '\tieee80211w=2\n'
+		if [ -n "$PASS" ]; then
+			printf '\tieee80211w=1\n'
+			[ -n "$psk" ] && printf '\tpsk=%s\n' "$psk"
+			[ -n "$sae" ] && printf '\tsae_password=%s\n' "$(hex "$PASS")"
+		fi
+		printf '}\n'
+	} > "$CONF.new" || die 5 "Could not write $CONF.new"
+	if [ -n "${AIWIFI_DRYRUN:-}" ]; then cat "$CONF.new"; rm -f "$CONF.new"; exit 0; fi
+	mv -f "$CONF.new" "$CONF"
+
+	stop_dhcp
+	ip -4 addr flush dev "$IF" 2>/dev/null
+	# Watch wpa_supplicant's events: a wrong password shows up long before the network gets disabled.
+	EV=/run/ai-wifi.$IF.events
+	: > "$EV"
+	( sleep "$((TIMEOUT + 5))" ) | wpa_cli -p "$CTRL" -i "$IF" > "$EV" 2>&1 &
+	MON=$!
+	trap 'kill "$MON" 2>/dev/null; rm -f "$EV"' EXIT
+	wpa reconfigure >/dev/null
+	wpa reassociate >/dev/null
+	say "Connecting to $SSID ..."
+	i=0; st=
+	while [ "$i" -lt "$TIMEOUT" ]; do
+		sleep 1; i=$((i + 1))
+		st=$(state)
+		[ "$st" = COMPLETED ] && break
+		# WRONG_KEY: WPA2 4-way handshake failed. AUTH-REJECT auth_type=3 status_code=15: SAE (WPA3) password mismatch.
+		if grep -q 'reason=WRONG_KEY' "$EV" || grep -Eq 'AUTH-REJECT .*auth_type=3 .*status_code=15' "$EV"; then
+			die 3 "Could not join $SSID: wrong password."
+		fi
+		if wpa list_networks | grep -q 'TEMP-DISABLED'; then
+			if [ -n "$PASS" ]; then die 3 "Could not join $SSID: wrong password?"; fi
+			die 3 "$SSID refused the connection."
+		fi
+		if { [ "$i" -ge 12 ] || { [ "$i" -ge 5 ] && grep -q 'NETWORK-NOT-FOUND' "$EV"; }; } && ! ssid_seen "$SSID"; then
+			case $st in SCANNING|INACTIVE|DISCONNECTED|"") die 2 "Network $SSID not found (out of range, or a typo in the name?)." ;; esac
+		fi
+	done
+	[ "$st" = COMPLETED ] || die 5 "Could not join $SSID (state: ${st:-unknown})."
+
+	udhcpc -b -i "$IF" -p "/run/udhcpc.$IF.pid" -s /usr/share/udhcpc/default.script -t 6 -T 2 -A 5 >/dev/null 2>&1
+	i=0; addr=$(ipv4)
+	while [ -z "$addr" ] && [ "$i" -lt 5 ]; do sleep 1; i=$((i + 1)); addr=$(ipv4); done
+	[ -n "$addr" ] || die 4 "Joined $SSID but got no IP address (DHCP failed). It keeps trying in the background."
+	say "Connected to $SSID, IP $addr"
+}
+
+cmd_status() {
+	IF=$(find_iface) || { say "iface="; say "state=no-adapter"; exit 1; }
+	say "iface=$IF"
+	st=$(state); addr=$(ipv4)
+	say "state=${st:-off}"
+	ssid=$(wpa status | sed -n 's/^ssid=//p' | awk "$unescape_awk"'{ print unesc($0) }')
+	[ -n "$ssid" ] && say "ssid=$ssid"
+	[ -n "$addr" ] && say "ip=$addr"
+	[ "$st" = COMPLETED ] && [ -n "$addr" ]
+}
+
+cmd_disconnect() {
+	IF=$(find_iface) || die 1 "No Wi-Fi adapter found."
+	stop_dhcp
+	wpa terminate >/dev/null
+	ip -4 addr flush dev "$IF" 2>/dev/null
+	say "Wi-Fi disconnected."
+}
+
+case ${1-} in
+	iface) find_iface ;;
+	scan) cmd_scan ;;
+	connect) shift; cmd_connect "${1-}" "${2-}" ;;
+	status) cmd_status ;;
+	disconnect) cmd_disconnect ;;
+	*) die 1 "usage: ai-wifi iface | scan | connect SSID [PASSWORD] | status | disconnect" ;;
+esac

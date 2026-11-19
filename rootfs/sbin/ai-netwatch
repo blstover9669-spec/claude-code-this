@@ -1,0 +1,15 @@
+#!/bin/sh
+# Keeps DHCP running on every wired network adapter, including ones that show up late
+# (slow drivers, USB adapters, phone USB tethering). Wi-Fi is handled by ai-wifi.
+while :; do
+  for n in /sys/class/net/*; do
+    i=${n##*/}
+    case $i in lo|sit*|tun*|tap*|wg*) continue ;; esac
+    [ -e "$n/wireless" ] || [ -e "$n/phy80211" ] && continue
+    pid=/run/udhcpc.$i.pid
+    [ -f "$pid" ] && kill -0 "$(cat "$pid")" 2>/dev/null && continue
+    ip link set "$i" up 2>/dev/null
+    udhcpc -b -i "$i" -p "$pid" -s /usr/share/udhcpc/default.script >/dev/null 2>&1
+  done
+  sleep 3
+done

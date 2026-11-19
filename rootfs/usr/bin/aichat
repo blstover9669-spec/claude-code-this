@@ -1,0 +1,622 @@
+#!/usr/bin/python3
+# AI OS - the only program on screen: a chat with an AI that can write, build and run apps.
+import getpass, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time
+import urllib.request, urllib.error
+try:
+    import readline  # arrow keys, history and line editing at the prompt
+except ImportError:
+    readline = None
+
+APPS = os.environ.get("AIOS_APPS", "/root/apps")
+KEY_FILES = [os.environ.get("AIOS_KEY", "/etc/ai-os/key"), "/root/.ai-key"]
+USER_KEY = os.environ.get("AIOS_USER_KEY", "/root/.ai-key")
+CC = os.environ.get("AIOS_CC", "tcc")
+API = "https://api.groq.com/openai/v1"
+MODEL = os.environ.get("AIOS_MODEL", "openai/gpt-oss-120b")
+MAX_MSGS = 40
+
+C = {"r": "\033[0m", "b": "\033[1m", "cy": "\033[36m", "gr": "\033[32m", "ye": "\033[33m",
+     "re": "\033[31m", "ma": "\033[35m", "dim": "\033[2m"}
+
+def col(c, s): return C[c] + s + C["r"]
+def info(s): print(col("ye", s))
+def err(s): print(col("re", s))
+
+SYSTEM = """You are the AI inside AI OS, a tiny live operating system whose only interface is this chat on a \
+Linux text console (about 80x25, ANSI colours ok, no mouse, no GUI/X, no web browser). You help the user with \
+anything, and you can create programs and files for them.
+
+To create or overwrite a file, write a block exactly like this (the user's OS saves it into its apps folder):
+<<<FILE name.ext
+...full file content...
+FILE>>>
+Use plain file names (no folders). Always write the complete file. You may create several files in one reply.
+Do not wrap the block in markdown code fences.
+
+What can run here (the user types /run name.ext):
+- .sh  : busybox sh script (busybox tools only).
+- .py  : python3, standard library only (no pip, no extra packages, no tkinter).
+- .c   : C compiled with tcc and musl libc into name.exe (tcc -o name.exe name.c -lm), then run. Keep C simple and portable (C99, POSIX, termios ok).
+- .exe : on this OS an .exe is a native Linux x86-64 program built from C here. It is NOT Windows: Windows .exe files cannot run. If the user wants an exe, write a .c file and tell them /run name.c (or /build name.c) makes name.exe.
+- .iso : bootable disc images, booted in a built-in virtual machine with /run name.iso. To make an ISO, write the files, then tell the user to type: /iso name.iso file1 file2 ... (this builds a bootable copy of AI OS with those files included).
+- .txt/.md/.html and others are shown as text.
+Programs are terminal programs. The internet is reachable but only via the python standard library (urllib).
+Other user commands: /files, /show, /rm, /send (shows you a file), /build, /iso, /wifi (join Wi-Fi), /new, /model, \
+/net, /help. Keep answers concise; plain text \
+is best because the console does not render markdown."""
+
+HELP = """Commands:
+  /run NAME [args]    run an app: .sh .py .c .exe .iso (extension optional)
+  /build NAME.c       compile C into NAME.exe
+  /iso OUT.iso [apps] make a bootable copy of AI OS with these apps (or all)
+  /files  list apps   /show NAME  print a file   /rm NAME  delete a file
+  /send NAME [msg]    show a file to the AI (/send notes.txt summarize it)
+  /wifi               scan and join Wi-Fi   (/wifi status, /wifi off)
+  /new    new chat    /model [name]  list or switch the AI model
+  /net    network     /key  change API key       /clear  clear screen
+  /reboot             /poweroff
+Anything else goes to the AI. Ask it for programs, then /run them.
+Ctrl+C stops a reply or a running program."""
+
+# ---------------------------------------------------------------- key
+def load_key():
+    for f in KEY_FILES:
+        try:
+            k = open(f).read().strip()
+            if k: return k
+        except OSError: pass
+    return ""
+
+def ask_key(cancel_ok=False):
+    hint = " (Enter keeps the current one)" if cancel_ok else ""
+    while True:
+        try: k = getpass.getpass("Enter your Groq API key (gsk_...)%s: " % hint).strip()
+        except KeyboardInterrupt:
+            print()
+            if cancel_ok: return ""
+            continue
+        except EOFError:
+            if not sys.stdin.isatty(): raise SystemExit(0)
+            print(); continue
+        if not k and cancel_ok: return ""
+        if k:
+            try:
+                os.makedirs(os.path.dirname(USER_KEY), exist_ok=True)
+                with open(USER_KEY, "w") as fh: fh.write(k + "\n")
+                os.chmod(USER_KEY, 0o600)
+            except OSError as e: err("could not save key: %s" % e)
+            return k
+
+# ---------------------------------------------------------------- API
+def api_req(path, key, body=None, timeout=60):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(API + path, data=data, headers={
+        "Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "ai-os/1.0"})
+    return urllib.request.urlopen(r, timeout=timeout)
+
+def net_error(e):
+    if isinstance(e, urllib.error.HTTPError):
+        try: msg = json.loads(e.read().decode()).get("error", {}).get("message", "")
+        except Exception: msg = ""
+        if e.code == 401: return "API key rejected (401). Use /key to enter a new one."
+        if e.code == 429: return "Rate limited by the AI service (429). Wait a moment and try again."
+        return "AI service error %d: %s" % (e.code, msg or e.reason)
+    reason = getattr(e, "reason", e)
+    return ("No connection to the AI (%s).\nCheck the network cable / VM network, then try again. /net shows status." % reason)
+
+def chat_stream(key, model, messages):
+    """Stream a reply; returns full text. Ctrl+C stops it (partial text kept)."""
+    body = {"model": model, "messages": messages, "stream": True}
+    out = []
+    tty = sys.stdout.isatty()
+    if tty: sys.stdout.write(col("dim", "(thinking...)")); sys.stdout.flush()
+    waiting = tty
+    try:
+        resp = api_req("/chat/completions", key, body, timeout=90)
+    except BaseException:
+        if tty: sys.stdout.write("\r\033[K"); sys.stdout.flush()
+        raise
+    sys.stdout.write(C["cy"])
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"): continue
+            d = line[5:].strip()
+            if d == "[DONE]": break
+            try: j = json.loads(d)
+            except ValueError: continue
+            if j.get("error"): raise RuntimeError(j["error"].get("message", "stream error"))
+            for ch in j.get("choices", []):
+                t = (ch.get("delta") or {}).get("content")
+                if t:
+                    if waiting: sys.stdout.write("\r\033[K"); waiting = False
+                    out.append(t); sys.stdout.write(t); sys.stdout.flush()
+    except KeyboardInterrupt:
+        sys.stdout.write(C["r"] + col("dim", "\n[stopped]"))
+    finally:
+        if waiting: sys.stdout.write("\r\033[K")
+        sys.stdout.write(C["r"] + "\n"); sys.stdout.flush()
+        try: resp.close()
+        except Exception: pass
+    return "".join(out)
+
+# ---------------------------------------------------------------- files
+FILE_RE = re.compile(r"<<<FILE[ \t]+([^\n]+?)[ \t]*\n(.*?)\n?FILE>>>", re.S)
+
+def safe_name(n):
+    n = os.path.basename(n.strip().strip("`'\"").replace("\\", "/"))
+    n = re.sub(r"[^A-Za-z0-9._+-]", "_", n).lstrip(".")
+    return n[:80]
+
+def save_files(text):
+    os.makedirs(APPS, exist_ok=True)
+    saved = []
+    for name, body in FILE_RE.findall(text):
+        n = safe_name(name)
+        if not n: continue
+        lines = body.split("\n")  # drop a markdown fence the model put inside the block
+        if lines and lines[0].strip().startswith("```"): lines = lines[1:]
+        while lines and not lines[-1].strip(): lines.pop()
+        if lines and lines[-1].strip() == "```": lines = lines[:-1]
+        body = "\n".join(lines)
+        p = os.path.join(APPS, n)
+        with open(p, "w") as fh: fh.write(body if body.endswith("\n") else body + "\n")
+        if n.endswith((".sh", ".py")): os.chmod(p, 0o755)
+        saved.append(n)
+        print(col("gr", "[saved apps/%s]" % n) + "  type " + col("b", "/run " + n))
+    return saved
+
+def find_app(name):
+    n = safe_name(name or "")
+    if not n: return None
+    p = os.path.join(APPS, n)
+    if os.path.isfile(p): return p
+    try: cands = [f for f in os.listdir(APPS) if os.path.splitext(f)[0] == n]
+    except OSError: return None
+    order = [".c", ".py", ".sh", ".exe", ".iso"]  # .c first: it is rebuilt, so never a stale .exe
+    cands.sort(key=lambda f: order.index(os.path.splitext(f)[1]) if os.path.splitext(f)[1] in order else 99)
+    return os.path.join(APPS, cands[0]) if cands else None
+
+def list_files():
+    try: fs = sorted(os.listdir(APPS))
+    except OSError: fs = []
+    if not fs: info("No apps yet. Ask the AI to make one!"); return
+    for f in fs:
+        print("  %-40s %9d bytes" % (f, os.path.getsize(os.path.join(APPS, f))))
+
+# ---------------------------------------------------------------- running
+def stty_sane():
+    if sys.stdin.isatty(): subprocess.call(["stty", "sane"], stderr=subprocess.DEVNULL)
+
+def run_fg(cmd, env=None, capture_err=True, err_to=None):
+    """Run in the foreground on the terminal; stderr is echoed and its tail captured. Returns (rc, errtail).
+    With capture_err=False, stderr goes to the terminal, or to the file err_to when given."""
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    tail = []
+    try:
+        p = subprocess.Popen(cmd, cwd=APPS, env=env, stderr=subprocess.PIPE if capture_err else err_to,
+                             preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+        t = None
+        if capture_err:
+            def pump():
+                fd = p.stderr.fileno()
+                while True:
+                    chunk = os.read(fd, 4096)
+                    if not chunk: break
+                    sys.stderr.buffer.write(chunk); sys.stderr.flush()
+                    tail.append(chunk)
+                    while sum(map(len, tail)) > 6000 and len(tail) > 1: tail.pop(0)
+            t = threading.Thread(target=pump, daemon=True); t.start()
+        rc = p.wait()
+        if t: t.join(2)
+    except OSError as e:
+        return 127, str(e)
+    finally:
+        signal.signal(signal.SIGINT, old)
+        stty_sane()
+    return rc, b"".join(tail).decode("utf-8", "replace")
+
+def compile_c(src):
+    exe = os.path.splitext(src)[0] + ".exe"
+    info("compiling %s -> %s" % (os.path.basename(src), os.path.basename(exe)))
+    try:
+        r = subprocess.run([CC, "-o", exe, src, "-lm"], cwd=APPS, capture_output=True, text=True)
+    except OSError:
+        return None, "C compiler (%s) not found" % CC
+    out = (r.stdout + r.stderr).strip()
+    if out: print(out)
+    if r.returncode != 0: return None, out or "compile failed"
+    os.chmod(exe, 0o755)
+    print(col("gr", "[built apps/%s]" % os.path.basename(exe)))
+    return exe, ""
+
+def show_file(n):
+    p = find_app(n)
+    if not p: err("No such file."); return
+    data = open(p, "rb").read()
+    if b"\0" in data[:4096]: info("%s is a binary file (%d bytes)." % (os.path.basename(p), len(data))); return
+    print(data.decode("utf-8", "replace"))
+
+def emulated_cpu():
+    """True when AI OS itself runs on a software-emulated CPU (QEMU without KVM). Such CPUs can claim
+    virtualization support, but KVM on top of them crashes, so VMs must use plain emulation there."""
+    try:
+        if "QEMU Virtual CPU" not in open("/proc/cpuinfo").read(): return False
+        cs = open("/sys/devices/system/clocksource/clocksource0/available_clocksource").read()
+        return "kvm-clock" not in cs  # QEMU *with* KVM underneath offers kvm-clock; pure emulation does not
+    except OSError: return False
+
+def run_app(arg):
+    """Returns (error_text, filename) when the AI could help fix it, else None."""
+    parts = arg.split()
+    if not parts: err("usage: /run NAME [args]"); return None
+    p = find_app(parts[0])
+    if not p: err("No app called %s. /files lists apps." % parts[0]); return None
+    args = parts[1:]
+    name = os.path.basename(p); ext = os.path.splitext(name)[1].lower()
+    src = name
+    env = dict(os.environ)
+    if ext == ".sh": cmd = ["sh", p] + args
+    elif ext == ".py": cmd = ["python3", p] + args
+    elif ext == ".c":
+        exe, e = compile_c(p)
+        if not exe: return ("Compiling %s failed:\n%s" % (name, e), name)
+        cmd = [exe] + args; name = os.path.basename(exe)
+    elif ext == ".exe":
+        with open(p, "rb") as fh: head = fh.read(4)
+        if head[:2] == b"MZ":
+            err("%s is a Windows program. Windows .exe files can't run on AI OS.\n"
+                "Ask the AI to rewrite it in C, then /run the .c file to get a native .exe." % name)
+            return None
+        c_src = os.path.splitext(name)[0] + ".c"
+        c_path = os.path.join(APPS, c_src)
+        if os.path.isfile(c_path):
+            src = c_src
+            if head != b"\x7fELF" or os.path.getmtime(c_path) > os.path.getmtime(p):
+                exe, e = compile_c(c_path)  # the source changed since the last build
+                if not exe: return ("Compiling %s failed:\n%s" % (c_src, e), c_src)
+                head = b"\x7fELF"
+        if head != b"\x7fELF": err("%s is not a runnable program." % name); return None
+        os.chmod(p, 0o755); cmd = [p] + args
+    elif ext == ".iso":
+        if not shutil.which("qemu-system-x86_64"): err("VM (qemu) not installed."); return None
+        avail = 1024
+        try:
+            for l in open("/proc/meminfo"):
+                if l.startswith("MemAvailable:"): avail = int(l.split()[1]) // 1024
+        except (OSError, ValueError): pass
+        mem = min(4096, avail - 400)  # the VM gets the free RAM, minus a reserve for AI OS itself
+        if mem < 256:
+            err("Not enough free memory for a VM (%d MB free). /rm big files such as old .iso files "
+                "(apps live in RAM), or give this PC/VM more RAM." % avail); return None
+        if mem < 1024:
+            info("Note: the VM gets %d MB of RAM. AI OS inside AI OS needs about 1 GB: /rm old .iso files "
+                 "or give this PC/VM more RAM if it fails to start." % mem)
+        cmd = ["qemu-system-x86_64", "-m", str(mem), "-cdrom", p, "-boot", "d", "-display", "curses",
+               "-nic", "user,model=e1000"]
+        if os.path.exists("/dev/kvm") and not emulated_cpu():
+            cmd += ["-accel", "kvm", "-accel", "tcg", "-cpu", "max"]  # hardware speed; falls back to emulation
+        if env.get("TERM") in (None, "", "dumb", "unknown"): env["TERM"] = "linux"
+        env["LC_ALL"] = "C.UTF-8"  # the VM's text screen uses box-drawing characters
+        info("Booting %s in a VM. To leave it: press Alt+2, type quit, press Enter.\n"
+             "(Alt+1 goes back to the VM screen. Inside AI OS, /poweroff also ends the VM.)" % name)
+        time.sleep(2)
+        with tempfile.TemporaryFile() as ef:  # QEMU's warnings would scribble over its own screen
+            rc, _ = run_fg(cmd, env, capture_err=False, err_to=ef)
+            subprocess.call(["clear"]); info("[VM exited %d]" % rc)
+            if rc != 0:
+                ef.seek(0)
+                msg = "\n".join(l for l in ef.read().decode("utf-8", "replace").splitlines()
+                                if not l.startswith("Could not convert"))
+                if msg.strip(): err(msg.strip()[-1500:])
+        return None
+    else:
+        show_file(name); return None
+    info("--- running %s (Ctrl+C stops it) ---" % name)
+    rc, tail = run_fg(cmd, env)
+    print(col("gr" if rc == 0 else "re", "--- %s exited with code %d ---" % (name, rc)))
+    if rc not in (0, 130, -signal.SIGINT):
+        return ("Running %s exited with code %d. Error output:\n%s" % (name, rc, tail.strip()[-3000:] or "(none)"), src)
+    return None
+
+# ---------------------------------------------------------------- ISO builder
+GRUB_CFG = """set timeout=3
+set default=0
+serial --unit=0 --speed=115200
+terminal_input console serial
+terminal_output console serial
+menuentry "AI OS" {
+  linux /boot/vmlinuz quiet loglevel=3
+  initrd /boot/initramfs
+}
+menuentry "AI OS (serial console)" {
+  linux /boot/vmlinuz console=tty0 console=ttyS0,115200 loglevel=3
+  initrd /boot/initramfs
+}
+"""
+
+def make_iso(arg):
+    parts = arg.split()
+    if not parts: err("usage: /iso OUT.iso [files...]"); return
+    out = safe_name(parts[0])
+    if not out.endswith(".iso"): out += ".iso"
+    if parts[1:]:
+        files = []
+        for f in parts[1:]:
+            p = find_app(f)
+            if not p: err("No app %s." % f); return
+            files.append(os.path.basename(p))
+    else:
+        files = sorted(f for f in os.listdir(APPS) if not f.endswith(".iso")) if os.path.isdir(APPS) else []
+    for tool in ("cpio", "gzip", "grub-mkrescue"):
+        if not shutil.which(tool): err("%s is missing; can't build ISOs here." % tool); return
+    if not os.path.isfile("/boot/vmlinuz"): err("/boot/vmlinuz missing; can't build ISOs here."); return
+    st = os.statvfs("/tmp"); free = st.f_bavail * st.f_frsize // (1 << 20)
+    if free < 400: err("Warning: only %d MB free in /tmp (RAM). The build may fail; give the PC/VM more RAM." % free)
+    info("Building %s with %d app(s): %s" % (out, len(files), " ".join(files) or "(none)"))
+    info("Note: the new ISO includes this OS's saved API key - only share it with people you trust.")
+    work = tempfile.mkdtemp(prefix="iso.", dir="/tmp")
+    try:
+        iso = os.path.join(work, "iso"); os.makedirs(iso + "/boot/grub")
+        extra = os.path.join(work, "extra")
+        for d in ("proc", "sys", "dev", "tmp", "run", "root/apps"): os.makedirs(os.path.join(extra, d))
+        for f in files: shutil.copy2(os.path.join(APPS, f), os.path.join(extra, "root/apps", f))
+        info("[1/3] packing the system (this can take a minute)...")
+        initrd = os.path.join(iso, "boot/initramfs")
+        # etc/wpa_supplicant holds the Wi-Fi password: never copy it into a new ISO
+        prune = " ".join("-path ./%s -prune -o" % d for d in ("proc", "sys", "dev", "tmp", "run", "root/apps",
+                                                               "etc/wpa_supplicant"))
+        # zstd packs ~30% smaller than gzip, so the new ISO needs less RAM to unpack when it boots
+        comp = "zstd -q -T0 -12" if shutil.which("zstd") else "gzip -1"
+        sh = ("set -e; { (cd / && find . -xdev %s -print | cpio -o -H newc 2>/dev/null); "
+              "(cd '%s' && find . | cpio -o -H newc 2>/dev/null); } | %s > '%s'" % (prune, extra, comp, initrd))
+        if subprocess.call(["sh", "-c", sh]) != 0: err("Packing failed."); return
+        shutil.copy2("/boot/vmlinuz", iso + "/boot/vmlinuz")
+        with open(iso + "/boot/grub/grub.cfg", "w") as fh: fh.write(GRUB_CFG)
+        info("[2/3] system image %d MB" % (os.path.getsize(initrd) >> 20))
+        info("[3/3] writing ISO...")
+        dest = os.path.join(APPS, out)
+        r = subprocess.run(["grub-mkrescue", "-o", dest, iso, "--", "-volid", "AIOS"], capture_output=True, text=True)
+        if r.returncode != 0: err("grub-mkrescue failed:\n" + r.stderr[-2000:]); return
+        print(col("gr", "[built apps/%s, %d MB]" % (out, os.path.getsize(dest) >> 20)) + "  type " + col("b", "/run " + out))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+# ---------------------------------------------------------------- misc
+def net_status():
+    try:  # one line per network adapter: name, link state, IPv4 address
+        out = subprocess.run(["ip", "addr"], capture_output=True, text=True).stdout
+        dev = None
+        for l in out.splitlines():
+            m = re.match(r"\d+: ([^:@]+)[^<]*<([^>]*)>", l)
+            if m:
+                dev = m.group(1)
+                if dev != "lo": print("  %-10s %s" % (dev, "up" if "LOWER_UP" in m.group(2) else "no link"))
+            elif l.strip().startswith("inet ") and dev != "lo":
+                print("  %-10s ip %s" % ("", l.split()[1]))
+    except OSError: pass
+    print("  internet: " + ("yes (default route)" if default_route() else "no default route yet"))
+    try:
+        urllib.request.urlopen(urllib.request.Request(API + "/models"), timeout=8)
+        print(col("gr", "AI service reachable."))
+    except urllib.error.HTTPError:
+        print(col("gr", "AI service reachable."))
+    except Exception as e:
+        err("AI service NOT reachable: %s" % getattr(e, "reason", e))
+        info("Plug in a network cable, use /wifi, or enable the VM's network adapter.")
+
+# ---------------------------------------------------------------- Wi-Fi (rootfs/sbin/ai-wifi does the work)
+WIFI_SCAN = []  # (signal_dbm, security, ssid) from the last /wifi scan
+
+def wired_ifaces():
+    try: names = os.listdir("/sys/class/net")
+    except OSError: return []
+    return [n for n in names if n != "lo" and not os.path.exists("/sys/class/net/%s/wireless" % n)
+            and not os.path.exists("/sys/class/net/%s/phy80211" % n)]
+
+def wifi_iface():
+    try: return subprocess.run(["ai-wifi", "iface"], capture_output=True, text=True).stdout.strip()
+    except OSError: return ""
+
+def printable(s): return "".join(c if c.isprintable() else "?" for c in s)
+
+def bars(dbm):
+    try: d = int(float(dbm))
+    except ValueError: return ""
+    n = 4 if d >= -55 else 3 if d >= -67 else 2 if d >= -75 else 1
+    return "[%s%s] %d dBm" % ("#" * n, " " * (4 - n), d)
+
+def wifi_cmd(rest):
+    global WIFI_SCAN
+    if not shutil.which("ai-wifi"): err("Wi-Fi tools are not installed."); return
+    sub = rest.strip()
+    if sub == "status":
+        r = subprocess.run(["ai-wifi", "status"], capture_output=True, text=True)
+        kv = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+        if kv.get("state") == "no-adapter": err("No Wi-Fi adapter found."); return
+        if r.returncode == 0:
+            print(col("gr", "Wi-Fi: connected to %s, IP %s" % (printable(kv.get("ssid", "?")), kv.get("ip", "?"))))
+        else: info("Wi-Fi (%s): %s" % (kv.get("iface", "?"), kv.get("state", "off").lower()))
+        return
+    if sub in ("off", "disconnect"):
+        subprocess.call(["ai-wifi", "disconnect"]); return
+    if sub in ("", "scan"):
+        info("Scanning for Wi-Fi networks...")
+        r = subprocess.run(["ai-wifi", "scan"], capture_output=True, text=True)
+        if r.returncode != 0: err((r.stderr or r.stdout).strip() or "Scan failed."); return
+        WIFI_SCAN = [tuple(l.split("\t", 2)) for l in r.stdout.splitlines() if l.count("\t") >= 2]
+        for i, (sig, sec, ssid) in enumerate(WIFI_SCAN[:30], 1):
+            print("  %2d. %-32s %-10s %s" % (i, printable(ssid)[:32], sec, bars(sig)))
+        info("Type /wifi NUMBER (or /wifi NAME) to connect.")
+        return
+    ssid, sec = sub, None
+    if sub.isdigit() and 1 <= int(sub) <= len(WIFI_SCAN):
+        _, sec, ssid = WIFI_SCAN[int(sub) - 1]
+    else:
+        for _, s2, n in WIFI_SCAN:
+            if n == sub: sec = s2; break
+    if sec == "Enterprise": err("%s uses Enterprise (802.1X) login, which AI OS does not support." % ssid); return
+    pw = ""
+    if sec not in ("open", "OWE"):
+        try:  # read straight from the keyboard: the password never enters the chat or goes to the AI
+            pw = getpass.getpass("Password for %s%s: " % (printable(ssid), "" if sec else " (Enter if none)"))
+        except (KeyboardInterrupt, EOFError):
+            print(); info("Cancelled."); return
+    rc, _ = run_fg(["ai-wifi", "connect", ssid, pw], capture_err=False)
+    if rc == 3: info("Type /wifi %s to try again." % (sub if sub.isdigit() else "NUMBER"))
+    elif rc == 0: info("Online. Talk away!")
+
+def banner():
+    if sys.stdout.isatty(): sys.stdout.write("\033[H\033[2J")
+    print(C["ma"] + C["b"] + r"""
+     _    ___    ___  ____
+    / \  |_ _|  / _ \/ ___|
+   / _ \  | |  | | | \___ \
+  / ___ \ | |  | |_| |___) |
+ /_/   \_\___|  \___/|____/ """ + C["r"])
+    print(col("dim", "  Talk to the AI. It can write apps for you; /run them. /help for commands.\n"))
+
+def default_route():
+    """True once DHCP has given us a default route."""
+    try:
+        for l in open("/proc/net/route").readlines()[1:]:
+            f = l.split()
+            if len(f) > 2 and f[1] == "00000000": return True
+    except OSError: pass
+    return False
+
+def wait_for_network(secs=20):
+    if not os.path.exists("/proc/net/route") or default_route(): return
+    if wired_ifaces():  # a cable or VM adapter may be getting its address: wait a little
+        sys.stdout.write(col("dim", "connecting to the network")); sys.stdout.flush()
+        for _ in range(secs):
+            time.sleep(1)
+            if default_route(): print(col("gr", " online")); return
+            sys.stdout.write(col("dim", ".")); sys.stdout.flush()
+        print()
+    if wifi_iface():
+        info("Not online yet. Type /wifi to pick a Wi-Fi network (or plug in a cable).")
+    else:
+        info("No network yet. Plug in a network cable or USB phone tethering - /net shows status.")
+
+def file_list_note():
+    try: fs = sorted(os.listdir(APPS))
+    except OSError: fs = []
+    return ("\n\nFiles currently in the apps folder: " + ", ".join(fs)) if fs else ""
+
+def file_text(p, limit=12000):
+    try: data = open(p, "rb").read()
+    except OSError: return None
+    if b"\0" in data[:4096]: return None
+    t = data.decode("utf-8", "replace")
+    return t if len(t) <= limit else t[:limit] + "\n...(truncated)"
+
+def fix_request(errtext, fname):
+    msg = errtext + "\n\nPlease fix %s and write the whole corrected file." % fname
+    t = file_text(os.path.join(APPS, fname))
+    if t is not None: msg += "\n\nCurrent %s:\n%s" % (fname, t)
+    return msg
+
+def rl_prompt(s):
+    # readline must be told which bytes of the prompt are invisible colour codes
+    return re.sub(r"(\033\[[0-9;]*m)", "\001\\1\002", s) if readline else s
+
+def read_line(prompt):
+    prompt = rl_prompt(prompt)
+    while True:
+        try: return input(prompt)
+        except KeyboardInterrupt: print()
+        except EOFError:
+            if not sys.stdin.isatty(): raise SystemExit(0)
+            print()
+
+def yes(q): return read_line(q).strip().lower().startswith("y")
+
+def main():
+    os.makedirs(APPS, exist_ok=True)
+    banner()
+    wait_for_network()
+    key = load_key() or ask_key()
+    model = MODEL
+    msgs = []
+    pending = None  # message to send to the AI without typing (fix requests)
+    while True:
+        try:
+            if pending: line, pending = pending, None
+            else: line = read_line(C["gr"] + C["b"] + "you> " + C["r"]).strip()
+            if not line: continue
+            if line.startswith("/"):
+                cmd, _, rest = line[1:].partition(" ")
+                cmd = cmd.lower(); rest = rest.strip()
+                if cmd in ("help", "h", "?"): print(HELP)
+                elif cmd == "run":
+                    fail = run_app(rest)
+                    if fail and yes("Ask the AI to fix it? [y/N] "):
+                        pending = fix_request(*fail)
+                elif cmd == "build":
+                    p = find_app(rest)
+                    if not p or not p.endswith(".c"): err("usage: /build NAME.c"); continue
+                    exe, e = compile_c(p)
+                    if not exe and yes("Ask the AI to fix it? [y/N] "):
+                        pending = fix_request("Compiling %s failed:\n%s" % (os.path.basename(p), e),
+                                              os.path.basename(p))
+                elif cmd == "send":
+                    name, _, note = rest.partition(" ")
+                    p = find_app(name)
+                    t = file_text(p) if p else None
+                    if t is None: err("usage: /send NAME [message]  (a text file in your apps)"); continue
+                    pending = "%s\n\nHere is %s:\n%s" % (note.strip() or "Look at this file.",
+                                                        os.path.basename(p), t)
+                elif cmd in ("files", "ls", "dir"): list_files()
+                elif cmd in ("show", "cat"): show_file(rest)
+                elif cmd in ("rm", "del"):
+                    p = find_app(rest)
+                    if p: os.remove(p); info("deleted " + os.path.basename(p))
+                    else: err("No such file.")
+                elif cmd == "iso": make_iso(rest)
+                elif cmd in ("new", "reset"): msgs = []; banner(); info("New conversation.")
+                elif cmd == "model":
+                    if rest: model = rest; info("model: " + model)
+                    else:
+                        try:
+                            data = json.load(api_req("/models", key, timeout=20)).get("data", [])
+                            for i in sorted(m["id"] for m in data): print(("* " if i == model else "  ") + i)
+                        except Exception as e: err(net_error(e))
+                        info("current: %s   (/model NAME to switch)" % model)
+                elif cmd == "net": net_status()
+                elif cmd in ("wifi", "wlan"): wifi_cmd(rest)
+                elif cmd == "key":
+                    k = ask_key(cancel_ok=True)
+                    if k: key = k; info("Key updated.")
+                    else: info("Key unchanged.")
+                elif cmd in ("clear", "cls"): banner()
+                elif cmd in ("reboot", "restart"): subprocess.call(["reboot"])
+                elif cmd in ("poweroff", "shutdown", "off"): subprocess.call(["poweroff"])
+                else: err("Unknown command. /help lists commands.")
+                continue
+            msgs.append({"role": "user", "content": line})
+            msgs = msgs[-MAX_MSGS:]
+            try:
+                reply = chat_stream(key, model, [{"role": "system", "content": SYSTEM + file_list_note()}] + msgs)
+            except KeyboardInterrupt:
+                print(col("dim", "[stopped]")); msgs.pop(); continue
+            except (urllib.error.URLError, OSError) as e:
+                err(net_error(e)); msgs.pop(); continue
+            except RuntimeError as e:
+                err("AI error: %s" % e); msgs.pop(); continue
+            if reply:
+                msgs.append({"role": "assistant", "content": reply})
+                save_files(reply)
+            else:
+                msgs.pop()
+        except SystemExit:
+            raise
+        except KeyboardInterrupt:
+            print()
+        except Exception as e:
+            err("error: %s" % e)
+
+if __name__ == "__main__":
+    for s in (signal.SIGQUIT, signal.SIGTSTP):
+        signal.signal(s, signal.SIG_IGN)
+    main()

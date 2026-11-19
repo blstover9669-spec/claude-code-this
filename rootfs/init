@@ -1,0 +1,21 @@
+#!/bin/sh
+# PID 1: mount basics, write inittab, hand over to busybox init.
+if [ ! -d /etc ] || [ ! -x /usr/bin/aichat ] || [ ! -x /usr/bin/python3 ]; then
+  # The kernel ran out of memory while unpacking the system into RAM and stopped half way.
+  echo
+  echo "AI OS could not unpack itself into memory: this computer or VM needs more RAM."
+  echo "Give it at least 1 GB (2 GB or more recommended) and start it again."
+  echo "Powering off in 60 seconds."
+  sleep 60; poweroff -f; sleep 3600
+fi
+mount -t proc proc /proc; mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null; mkdir -p /dev/pts /dev/shm; mount -t devpts devpts /dev/pts
+mount -t tmpfs tmp /tmp; mount -t tmpfs run /run
+{
+  echo '::sysinit:/sbin/ai-sysinit'
+  echo 'tty1::respawn:/usr/bin/aichat'
+  grep -q 'console=ttyS0' /proc/cmdline && echo 'ttyS0::respawn:/usr/bin/aichat'
+  echo '::ctrlaltdel:/sbin/reboot'
+  echo '::shutdown:/bin/umount -a -r'
+} > /etc/inittab
+exec /sbin/init

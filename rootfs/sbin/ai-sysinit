@@ -1,0 +1,16 @@
+#!/bin/sh
+# Load drivers for the hardware present, bring up wired networking, set the clock.
+hostname -F /etc/hostname
+dmesg -n 1
+# Devices plugged in later (USB keyboards, USB network adapters, phone tethering) get their
+# drivers through mdev, the busybox hotplug helper (see /etc/mdev.conf).
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+coldplug() { find /sys/devices -name modalias -exec cat {} + 2>/dev/null | sort -u | xargs modprobe -qab 2>/dev/null; }
+coldplug
+modprobe -qa af_packet loop isofs usbhid hid_generic kvm_intel kvm_amd 2>/dev/null
+sleep 1; coldplug
+ip link set lo up
+hwclock -s 2>/dev/null
+/sbin/ai-netwatch >/dev/null 2>&1 &
+( sleep 6; ntpd -n -q -p pool.ntp.org >/dev/null 2>&1 ) &
+mkdir -p /root/apps
