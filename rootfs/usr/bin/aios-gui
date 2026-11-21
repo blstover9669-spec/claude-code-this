@@ -1,0 +1,29 @@
+#!/bin/sh
+# AI OS's graphical chat, started on tty1 by init. Uses the text chat (/usr/bin/aichat) instead when:
+#  - the boot menu's text-mode entry was used (kernel argument aios.text=1),
+#  - there is no graphical screen (/dev/fb0),
+#  - the graphical chat stops with an error. A crash in its first minute is remembered for the
+#    rest of this session, so init's respawn doesn't keep retrying a graphical chat that can't run.
+# The graphical chat's own messages go to /run/aios/gui.log.
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PYTHONPATH=/usr/lib/aios
+RUN=/run/aios
+mkdir -p "$RUN" 2>/dev/null
+
+text_chat() {
+	/sbin/ai-progress --done 2>/dev/null        # close the loading screen if it is still showing
+	kbd_mode -u -C /dev/tty1 2>/dev/null         # give the keyboard back to the text console
+	exec /usr/bin/aichat
+}
+
+grep -qw 'aios.text=1' /proc/cmdline 2>/dev/null && exec /usr/bin/aichat
+[ -e "$RUN/gui-failed" ] && text_chat
+[ -e /dev/fb0 ] || text_chat
+
+start=$(date +%s)
+python3 -m aios.gui 2>>"$RUN/gui.log"
+rc=$?
+[ "$rc" = 0 ] && exit 0                         # a normal exit; init starts the chat again
+echo "graphical chat stopped with code $rc after $(( $(date +%s) - start ))s" >> "$RUN/gui.log"
+[ $(( $(date +%s) - start )) -lt 60 ] && : > "$RUN/gui-failed"
+text_chat

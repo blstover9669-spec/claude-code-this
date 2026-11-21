@@ -1,7 +1,17 @@
 # AI OS
 
 A tiny live operating system whose only screen is a chat with an AI. There is no desktop
-and no shell: you talk to the AI, it writes programs for you, and you run them with `/run`.
+and no shell: you talk to the AI, it writes programs for you, and you run them with one click.
+
+The chat is a full-screen graphical app (mouse and keyboard): a sidebar with your apps,
+Games, Wi-Fi, Settings and Power; chat bubbles; every file the AI writes shows up as a card
+with **Run**, **Edit** and **View** buttons; programs run in a terminal window on top of the chat, and
+if one fails, **Ask AI to fix** sends the error and the source back to the AI. You can edit any
+file yourself in the built-in code editor (line numbers, syntax colours, selection, copy/paste,
+undo; Ctrl+S saves, F5 runs), make a new one with **+ New** in the Apps list, and delete files
+from their menu (it asks first). Slash commands
+work in the message box too. The text-mode boot entry (and the serial console) give the same
+chat as plain text:
 
 ```
 you> make me a snake game in C
@@ -10,6 +20,21 @@ you> make me a snake game in C
 you> /run snake
 compiling snake.c -> snake.exe
 ```
+
+## Games while it loads
+
+GRUB only loads a small starter system; the starter shows a loading screen while it reads
+the rest of AI OS from the disc or USB stick, and you can play while you wait:
+
+| Game | Controls |
+| --- | --- |
+| **Space Shooter** (2D): waves of alien ships, power-ups, a boss every 5th wave | arrows/WASD move, Space fires |
+| **Dino Run** (2D): jump the cacti, duck the pterosaurs | Space/Up jump, Down duck |
+| **Dino Run 3D**: three lanes in real (software-rendered) 3D | Left/Right lanes, Space/Up jump |
+
+A slim bar across the top of the game keeps showing the loading progress, Esc goes back to
+the menu, and the game closes by itself the moment AI OS is ready. The same games are under
+**Games** in the chat's sidebar.
 
 ## What it can do
 
@@ -23,6 +48,7 @@ compiling snake.c -> snake.exe
 | `/run NAME.iso` | boots the ISO in a built-in virtual machine (QEMU, text display) |
 | `/iso OUT.iso [apps]` | builds a bootable copy of AI OS with those apps inside |
 | `/build NAME.c` | compiles without running |
+| `/edit NAME` | edit a file yourself (a new name makes a new file); vi in the text chat |
 | `/files` `/show` `/rm` | list, print, delete apps |
 | `/send NAME [msg]` | shows a file to the AI |
 | `/wifi` | scan for and join a Wi-Fi network |
@@ -51,11 +77,19 @@ ask the AI to write the program in C instead.
 no hard disk, `ai-os.iso` in the optical drive, network adapter on NAT. Tick
 *Skip Unattended Installation* if the new-VM wizard offers it.
 
-Starting up, AI OS shows a counter while the boot menu reads the system into memory, then a
-loading bar with each step (drivers, network, clock) until the chat appears. On a normal PC
-or VM that takes 10–20 seconds. If it ever stops:
+Boot menu entries:
+
+- **AI OS**: the normal start, with the graphical loading screen, games and chat.
+- **AI OS (serial console)**: text chat on the first serial port as well (for headless VMs).
+- **AI OS (text mode, no graphics)**: loads everything up front and uses the text chat; pick
+  it if the graphics don't work on a PC.
+- **AI OS (show boot messages)**: the normal start with all kernel messages shown.
+
+On a normal PC or VM the chat is up in 10–20 seconds. If it ever stops:
 
 - pick **AI OS (show boot messages)** in the boot menu to see where it stops;
+- "couldn't find its disc or USB stick": pick **AI OS (text mode, no graphics)**, which
+  doesn't need to find it again;
 - "needs a 64-bit processor": set the VM's version to a 64-bit one, or turn on VT-x/AMD-V
   in the PC's BIOS if VirtualBox only offers 32-bit versions;
 - "needs more RAM": raise the VM's memory to 2 GB;
@@ -82,15 +116,28 @@ echo 'gsk_your_key' > groq.key     # optional; ignored by git
 sudo ./build.sh                     # -> out/ai-os.iso
 ```
 
-The system is Alpine Linux (packages downloaded during the build), the `linux-lts` kernel with
-a trimmed driver set, and one program: [`rootfs/usr/bin/aichat`](rootfs/usr/bin/aichat).
+The system is Alpine Linux (packages downloaded during the build) with the `linux-lts` kernel
+and a trimmed driver set. The graphical programs are Python with pygame, drawing straight onto
+the Linux framebuffer (no X or Wayland) and reading keyboard and mouse from `/dev/input`.
+The ISO holds two archives: `boot/starter.img`, which GRUB loads, and `boot/system.img`, which
+the starter streams in while the loading screen runs. Interface text uses Liberation Sans, the
+open font with Arial's metrics (Arial itself can't be redistributed); code uses JetBrains Mono.
 
 | File | Role |
 | --- | --- |
 | `build.sh` | downloads Alpine packages and the kernel, assembles the root filesystem, builds the ISO |
-| `rootfs/init` | first process: mounts the basics, starts busybox init |
+| `tools/starter_files.py` | decides what goes into the starter (with every library it needs) |
+| `rootfs/init` | the starter: finds the disc or USB stick, streams `system.img` in, starts busybox init |
 | `rootfs/sbin/ai-sysinit` | loads drivers, starts networking, sets the clock |
+| `rootfs/sbin/ai-progress` | the loading bar (text) and the progress the loading screen shows |
 | `rootfs/sbin/ai-netwatch` | keeps DHCP running on every wired adapter |
 | `rootfs/sbin/ai-wifi` | Wi-Fi scan and connect (used by `/wifi`) |
-| `rootfs/usr/bin/aichat` | the chat, app runner and ISO builder; the only thing on screen |
-| `grub/grub.cfg` | boot menu (normal and serial-console entries) |
+| `rootfs/usr/lib/aios/aios/loader_ui.py` | the loading screen with the games |
+| `rootfs/usr/lib/aios/aios/games/` | Space Shooter, Dino Run, Dino Run 3D |
+| `rootfs/usr/lib/aios/aios/gui.py` | the graphical chat (with `widgets.py`, `term.py` for app windows, `editor.py`) |
+| `rootfs/usr/lib/aios/aios/core.py` | chat logic shared by the graphical and the text chat |
+| `rootfs/usr/lib/aios/aios/display.py`, `theme.py`, `boot.py` | screen and input, look, loading hand-off |
+| `rootfs/usr/bin/aios-gui` | starts the graphical chat, or the text chat when there's no screen |
+| `rootfs/usr/bin/aichat` | the text chat |
+| `grub/grub.cfg` | boot menu; `grub-classic.cfg` is the menu of ISOs made with `/iso` |
+| `fonts/` | Liberation Sans and JetBrains Mono (SIL OFL, see `fonts/OFL.txt`) |

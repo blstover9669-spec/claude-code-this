@@ -1,8 +1,13 @@
 #!/bin/sh
-# ai-progress PERCENT LABEL...   draws AI OS's boot loading bar on the screen
-# ai-progress --title            clears the screen and draws the heading above the bar
-# Writes to the main screen (tty1) and, when the serial-console boot entry is used, to ttyS0 too.
-
+# ai-progress PERCENT LABEL [DETAIL]   moves AI OS's loading bar
+# ai-progress --title                  clears the text screen and draws the heading above the bar
+# ai-progress --error MESSAGE          shows a problem (loading has stopped)
+# ai-progress --done                   tells the graphical loading screen that AI OS is ready
+#
+# The graphical loading screen (aios.loader_ui, the one with games) reads /run/aios/progress.json.
+# When it isn't running, the bar is drawn as text on the main screen (tty1) and, with the
+# serial-console boot entry, on ttyS0 too.
+RUN=/run/aios
 targets=${AIP_TARGETS:-}  # ai-sysinit works this out once, so each redraw stays quick
 if [ -z "$targets" ]; then
 	targets="/dev/tty1"
@@ -10,15 +15,37 @@ if [ -z "$targets" ]; then
 fi
 
 out() { for t in $targets; do [ -w "$t" ] && printf '%b' "$1" > "$t" 2>/dev/null; done; }
+ui_running() { [ -f "$RUN/loader-ui.pid" ] && kill -0 "$(cat "$RUN/loader-ui.pid" 2>/dev/null)" 2>/dev/null; }
+esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+json() {  # fraction stage detail done error
+	mkdir -p "$RUN" 2>/dev/null
+	printf '{"fraction": %s, "stage": "%s", "detail": "%s", "done": %s, "error": %s, "time": %s}\n' \
+		"$1" "$(esc "$2")" "$(esc "$3")" "$4" "$5" "$(date +%s)" > "$RUN/progress.json.tmp" 2>/dev/null &&
+		mv -f "$RUN/progress.json.tmp" "$RUN/progress.json" 2>/dev/null
+}
+last() { sed -n "s/.*\"$1\": \"\\([^\"]*\\)\".*/\\1/p" "$RUN/progress.json" 2>/dev/null; }
 
-if [ "$1" = "--title" ]; then
-	out '\033[?25l\033[2J\033[H\n\n   \033[1;35mAI OS\033[0m is starting\n\n'  # cursor hidden until the chat
-	exit 0
-fi
+case $1 in
+--title)
+	ui_running || out '\033[?25l\033[2J\033[H\n\n   \033[1;35mAI OS\033[0m is starting\n\n'  # cursor hidden until the chat
+	exit 0 ;;
+--error)
+	shift
+	frac=$(sed -n 's/.*"fraction": \([0-9.]*\).*/\1/p' "$RUN/progress.json" 2>/dev/null)
+	json "${frac:-0}" "$(last stage)" "" false "\"$(esc "$*")\""
+	ui_running || out "\r\033[K\n\n   \033[1;31m$*\033[0m\n"
+	exit 0 ;;
+--done)
+	json 1.0 "AI OS is ready" "" true null
+	exit 0 ;;
+esac
 
 p=${1:-0}; shift
 [ "$p" -gt 100 ] 2>/dev/null && p=100
-label="$*"
+label=$1; detail=${2:-}
+if [ "$p" -ge 100 ]; then frac=1.0; else frac=0.$(printf '%02d' "$p"); fi
+json "$frac" "$label" "$detail" false null
+ui_running && exit 0
 width=30
 n=$((p * width / 100))
 fill=""; rest=""; i=0
@@ -26,5 +53,6 @@ while [ "$i" -lt "$width" ]; do
 	if [ "$i" -lt "$n" ]; then fill="$fill█"; else rest="$rest░"; fi
 	i=$((i + 1))
 done
+[ -n "$detail" ] && label="$label  ($detail)"
 # \r returns to the start of the line, \033[K clears what an older, longer label left behind
 out "\r   \033[1;35m$fill\033[0;37m$rest\033[0m $(printf '%3d' "$p")%  $label\033[K"

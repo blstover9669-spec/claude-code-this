@@ -24,9 +24,12 @@ $APK --root "$R" --initdb -U add \
   python3 tcc tcc-libs tcc-libs-static musl-dev \
   qemu-system-x86_64 qemu-ui-curses ncurses-terminfo-base \
   xorriso mtools grub grub-bios grub-efi cpio zstd \
-  wpa_supplicant wireless-regdb
+  wpa_supplicant wireless-regdb \
+  py3-pygame py3-wcwidth
 rm -rf "$R/usr/lib/python3"*/test "$R/usr/lib/python3"*/ensurepip "$R/usr/lib/python3"*/idlelib \
-       "$R/usr/lib/python3"*/tkinter "$R/var/cache/apk/"*
+       "$R/usr/lib/python3"*/tkinter "$R/var/cache/apk/"* \
+       "$R/usr/lib/python3"*/site-packages/pygame/examples "$R/usr/lib/python3"*/site-packages/pygame/tests \
+       "$R/usr/lib/python3"*/site-packages/pygame/docs
 find "$R/usr/lib" -name __pycache__ -prune -exec rm -rf {} +
 # precompile Python's standard library: without it, every boot spends seconds (minutes in a slow VM)
 # compiling the modules the chat imports before it can show anything
@@ -94,22 +97,52 @@ echo "Wi-Fi firmware: $(wc -l < "$B/fw.list") files, $(du -sh "$FD" | cut -f1)"
 
 # 4. our files
 cp -a rootfs/. "$R"/
+find "$R/usr/lib/aios" "$R/usr/bin" -name __pycache__ -prune -exec rm -rf {} +   # caches from test runs
 chmod 755 "$R/init" "$R/usr/bin/aichat" "$R"/sbin/ai-*
+[ -f "$R/usr/bin/aios-gui" ] && chmod 755 "$R/usr/bin/aios-gui"
+# the graphical programs' fonts (Liberation Sans, the Arial-compatible one, and JetBrains Mono;
+# SIL OFL, see fonts/OFL.txt)
+mkdir -p "$R/usr/share/fonts/aios" && cp fonts/*.ttf fonts/OFL.txt "$R/usr/share/fonts/aios/"
+# pyte, the terminal emulator inside the chat's app windows (pure Python, LGPL-3.0), checked by hash
+PYTE_WHL=pyte-0.8.2-py3-none-any.whl
+PYTE_SHA=85db42a35798a5aafa96ac4d8da78b090b2c933248819157fc0e6f78876a0135
+if [ ! -s "$B/$PYTE_WHL" ]; then
+  curl -fsSL -o "$B/$PYTE_WHL.part" "https://files.pythonhosted.org/packages/59/d0/bb522283b90853afbf506cd5b71c650cf708829914efd0003d615cf426cd/$PYTE_WHL"
+  mv "$B/$PYTE_WHL.part" "$B/$PYTE_WHL"
+fi
+echo "$PYTE_SHA  $B/$PYTE_WHL" | sha256sum -c - >/dev/null
+cp "$B/$PYTE_WHL" "$R/tmp/" && chroot "$R" /usr/bin/unzip -q "/tmp/$PYTE_WHL" -d /tmp/pyte
+cp -a "$R/tmp/pyte/pyte" "$R/usr/lib/aios/pyte" && rm -rf "$R/tmp/pyte" "$R/tmp/$PYTE_WHL"
+PYTHONHASHSEED=0 chroot "$R" /usr/bin/python3 -m compileall -q -j 0 /usr/lib/aios >/dev/null
 KEY=${GROQ_API_KEY:-$( [ -f groq.key ] && cat groq.key || true )}
 if [ -n "$KEY" ]; then mkdir -p "$R/etc/ai-os"; printf '%s\n' "$KEY" > "$R/etc/ai-os/key"; chmod 600 "$R/etc/ai-os/key"; fi
 echo ai-os > "$R/etc/hostname"
 mkdir -p "$R/root/apps"
-cp grub/grub.cfg "$R/boot/grub.cfg"   # /iso gives the ISOs it makes this same boot menu
+cp grub/grub.cfg "$R/boot/grub.cfg"
+cp grub/grub-classic.cfg "$R/boot/grub-classic.cfg"   # /iso makes single-archive ISOs with this menu
+# this build's ID: the starter only accepts a disc or USB stick whose boot/aios.id matches
+head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$R/etc/aios.id"
+cp "$R/etc/aios.id" "$ISO/boot/aios.id"
 
-# 5. initramfs + ISO
-# The files /init needs to print "needs more RAM" go first: when the kernel runs out of memory
-# while unpacking, it stops part way through the archive, and these are already in place.
-EARLY="./init ./bin ./bin/busybox ./bin/sh ./bin/echo ./bin/sleep ./lib ./lib/ld-musl-x86_64.so.1 ./sbin ./sbin/poweroff"
-# zstd unpacks about 10x faster than xz: that unpacking is most of the wait between the boot menu and the chat
-# .aios-complete goes last: /init only finds it when the whole system was unpacked
+# 5. the two archives
+# starter.img: what GRUB loads (shell tools, Python + pygame, the loading screen and games, drivers
+#   to find the disc). It shows the loading screen while it reads system.img, the rest of AI OS.
+# The files /init needs to print "needs more RAM" go first in the starter, and .aios-complete goes
+# last in system.img: /init only finds it when everything was unpacked. zstd unpacks ~10x faster than xz.
 touch "$R/.aios-complete"
-(cd "$R" && { printf '%s\n' . $EARLY; find . | grep -vxF -e . -e ./.aios-complete $(printf -- '-e %s ' $EARLY); \
-  echo ./.aios-complete; } | cpio -o -H newc --quiet | zstd -q -T0 -19) > "$ISO/boot/initramfs"
+cp tools/starter_files.py "$R/boot/starter_files.py"      # /boot itself is not part of the starter
+chroot "$R" /usr/bin/python3 /boot/starter_files.py > "$B/starter.list"
+rm -f "$R/boot/starter_files.py"
+cp "$B/starter.list" "$R/usr/lib/aios/starter.list"   # so /iso can tell the two parts apart later
+echo ./usr/lib/aios/starter.list >> "$B/starter.list"
+EARLY="./init ./bin ./bin/busybox ./bin/sh ./bin/echo ./bin/sleep ./lib ./lib/ld-musl-x86_64.so.1 ./sbin ./sbin/poweroff"
+(cd "$R" && { printf '%s\n' . $EARLY; grep -vxF -e . $(printf -- '-e %s ' $EARLY) "$B/starter.list"; } \
+  | cpio -o -H newc --quiet | zstd -q -T0 -19) > "$ISO/boot/starter.img"
+(cd "$R" && find . | grep -vxF -f "$B/starter.list" | grep -vxF -e . -e ./.aios-complete; echo ./.aios-complete) \
+  > "$B/system.list"
+(cd "$R" && cpio -o -H newc --quiet < "$B/system.list" | zstd -q -T0 -19) > "$ISO/boot/system.img"
+echo "starter: $(wc -l < "$B/starter.list") files, $(du -h "$ISO/boot/starter.img" | cut -f1);" \
+     "system: $(wc -l < "$B/system.list") files, $(du -h "$ISO/boot/system.img" | cut -f1)"
 cp grub/grub.cfg "$ISO/boot/grub/grub.cfg"
 grub-mkrescue -o out/ai-os.iso "$ISO" -- -volid AIOS 2>/dev/null
 ls -lh out/ai-os.iso

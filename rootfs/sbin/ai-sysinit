@@ -1,7 +1,8 @@
 #!/bin/sh
 # Load drivers for the hardware present, bring up wired networking, set the clock.
-# Every step moves the loading bar, and a slow or stuck driver can't hold up the chat:
-# drivers load in the background and the chat starts after 25 seconds at most.
+# Every step moves the loading bar (the starter used 0-80% for reading AI OS from the disc),
+# and a slow or stuck driver can't hold up the chat: drivers load in the background and the
+# chat starts after 25 seconds at most.
 P=/sbin/ai-progress
 AIP_TARGETS="/dev/tty1"
 grep -q 'console=ttyS0' /proc/cmdline && AIP_TARGETS="$AIP_TARGETS /dev/ttyS0"
@@ -13,26 +14,29 @@ dmesg -n 1
 echo /sbin/mdev > /proc/sys/kernel/hotplug
 coldplug() { find /sys/devices -name modalias -exec cat {} + 2>/dev/null | sort -u | xargs modprobe -qab 2>/dev/null; }
 
-$P 20 "loading drivers"
+$P 82 "Loading drivers"
 (
 	coldplug
-	modprobe -qa af_packet loop isofs usbhid hid_generic kvm_intel kvm_amd 2>/dev/null
+	modprobe -qa af_packet loop isofs evdev usbhid hid_generic kvm_intel kvm_amd 2>/dev/null
 	sleep 1; coldplug
 	touch /run/ai-drivers-done
 ) >/dev/null 2>&1 &
 i=0
 while [ ! -e /run/ai-drivers-done ] && [ "$i" -lt 50 ]; do
 	sleep 0.5; i=$((i + 1))
-	$P $((20 + i)) "loading drivers"
+	$P $((82 + i / 6)) "Loading drivers"
 done
 
-$P 75 "starting the network"
+$P 91 "Starting the network"
 ip link set lo up
 /sbin/ai-netwatch >/dev/null 2>&1 &
 
-$P 85 "setting the clock"
+$P 93 "Setting the clock"
 hwclock -s 2>/dev/null
 ( sleep 6; ntpd -n -q -p pool.ntp.org >/dev/null 2>&1 ) &
 mkdir -p /root/apps
 
-$P 95 "starting the chat"
+$P 96 "Starting the chat"
+# The chat closes the loading screen once it can draw. If it never does (it crashed and the
+# text chat took over), close the loading screen anyway after two minutes.
+( sleep 120; $P --done ) >/dev/null 2>&1 &
