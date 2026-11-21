@@ -149,8 +149,9 @@ class Display:
         os.close(self._tty)
         self._tty = None
 
-    def flip(self):
-        """Show what has been drawn on `surface`."""
+    def flip(self, rects=None):
+        """Show what has been drawn on `surface`. With `rects`, only those areas are copied to the
+        screen (much cheaper when little changed, e.g. the mouse pointer moving)."""
         if self.headless:
             if self.shots:
                 os.makedirs(self.shots, exist_ok=True)
@@ -158,7 +159,14 @@ class Display:
             self._frame += 1
             return
         if self._fb is not None:
-            self._fb.blit(self.surface, (0, 0))
+            if rects:
+                bounds = self.surface.get_rect()
+                for r in rects:
+                    r = pygame.Rect(r).clip(bounds)
+                    if r.w and r.h:
+                        self._fb.blit(self.surface, r, r)
+            else:
+                self._fb.blit(self.surface, (0, 0))
         else:
             self._conv.blit(self.surface, (0, 0))
             self._mem[:] = self._conv.get_buffer().raw

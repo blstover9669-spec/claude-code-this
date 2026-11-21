@@ -4,7 +4,7 @@ It talks to the AI service, saves the files the AI writes, finds, builds and run
 bootable ISOs and reports on the network. Nothing here prints or draws: each chat shows the
 results its own way. No pygame here, so the text chat works even without a screen.
 """
-import json, os, re, shutil, subprocess, tempfile, urllib.error, urllib.request
+import json, os, re, shutil, subprocess, tempfile, time, urllib.error, urllib.request
 
 APPS = os.environ.get("AIOS_APPS", "/root/apps")
 KEY_FILES = [os.environ.get("AIOS_KEY", "/etc/ai-os/key"), "/root/.ai-key"]
@@ -81,8 +81,129 @@ def api_req(path, key, body=None, timeout=60):
     return urllib.request.urlopen(r, timeout=timeout)
 
 
+# ---------------------------------------------------------------------------- models and free-plan limits
+MODEL_FILE = os.environ.get("AIOS_MODEL_FILE", "/root/.ai-model")
+# Chat models on Groq's free plan, best first: (id, name, what it's good for). Each model has its
+# own free limit (about 8,000 tokens a minute), so when one is used up another can answer.
+MODELS = [
+    ("openai/gpt-oss-120b", "GPT-OSS 120B", "Smartest. Best for bigger programs."),
+    ("openai/gpt-oss-20b", "GPT-OSS 20B", "Fast and light. A good backup."),
+    ("qwen/qwen3.8-27b", "Qwen 3.8 27B", "Quick answers, good all-rounder."),
+    ("allam-2-7b", "ALLaM 2 7B", "Small. Arabic and English."),
+]
+NOT_CHAT = ("whisper", "guard", "orpheus", "safeguard", "tts", "embed", "playai", "distil")
+LIMITED = {}            # model -> time when its free limit should be available again
+HISTORY = 12            # earlier messages sent with each request (the free limit counts every token)
+
+
+class RateLimited(Exception):
+    """The AI service's free limit for `model` is used up; try again after `wait` seconds."""
+
+    def __init__(self, model, wait, daily, detail=""):
+        super().__init__(detail or "rate limited")
+        self.model, self.wait, self.daily, self.detail = model, wait, daily, detail
+
+
+def is_chat_model(mid):
+    return not any(w in mid.lower() for w in NOT_CHAT)
+
+
+def model_name(mid):
+    return {m: n for m, n, _ in MODELS}.get(mid, mid.split("/")[-1])
+
+
+def model_blurb(mid):
+    return {m: b for m, _, b in MODELS}.get(mid, "")
+
+
+def chat_models(key):
+    """The chat models this key can use, best first (the known list when the service can't be asked)."""
+    try:
+        have = [m for m in list_models(key) if is_chat_model(m)]
+    except Exception:
+        return [m for m, _, _ in MODELS]
+    order = [m for m, _, _ in MODELS]
+    return sorted(have, key=lambda m: (order.index(m) if m in order else len(order), m))
+
+
+def load_model():
+    try:
+        m = open(MODEL_FILE).read().strip()
+        if m:
+            return m
+    except OSError:
+        pass
+    return MODEL
+
+
+def save_model(m):
+    try:
+        with open(MODEL_FILE, "w") as fh:
+            fh.write(m + "\n")
+    except OSError:
+        pass
+
+
+def limited_for(mid):
+    """Seconds until this model's free limit is available again (0 when it's fine)."""
+    return max(0.0, LIMITED.get(mid, 0) - time.time())
+
+
+def backup_model(mid, models=None):
+    """Another chat model that isn't rate limited right now, or None."""
+    for m in models or [m for m, _, _ in MODELS]:
+        if m != mid and limited_for(m) == 0:
+            return m
+    return None
+
+
+def wait_text(sec):
+    sec = int(round(sec))
+    if sec < 90:
+        return "%d s" % max(1, sec)
+    if sec < 5400:
+        return "%d min" % round(sec / 60)
+    return "%d h %d min" % (sec // 3600, sec % 3600 // 60)
+
+
+def _seconds(s):
+    """'4.875s', '1m2.5s', '12m57.6s', '2h3m' or plain seconds -> seconds."""
+    total, found = 0.0, False
+    for num, unit in re.findall(r"([\d.]+)\s*(ms|h|m|s)?", s or ""):
+        try:
+            v = float(num)
+        except ValueError:
+            continue
+        found = True
+        total += v * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}.get(unit or "s", 1)
+    return total if found else None
+
+
+def _rate_limited(e, model):
+    try:
+        detail = json.loads(e.read().decode()).get("error", {}).get("message", "")
+    except Exception:
+        detail = ""
+    wait = None
+    m = re.search(r"try again in ([\dhms.]+)", detail)
+    if m:
+        wait = _seconds(m.group(1))
+    if wait is None and e.headers is not None:
+        wait = _seconds(e.headers.get("retry-after", "")) or _seconds(e.headers.get("x-ratelimit-reset-tokens", ""))
+    wait = wait if wait is not None else 20.0
+    daily = bool(re.search(r"per day|\((RPD|TPD)\)", detail))
+    LIMITED[model] = time.time() + wait
+    return RateLimited(model, wait, daily, detail)
+
+
 def net_error(e):
     """A plain-language message for a failed request to the AI service."""
+    if isinstance(e, RateLimited):
+        if e.daily:
+            return ("Today's free limit for %s is used up (it comes back in %s). Pick another model: "
+                    "each one has its own limit." % (model_name(e.model), wait_text(e.wait)))
+        return ("%s's free limit is used up for a moment (the free plan allows about 8,000 tokens a minute "
+                "per model). Try again in %s, or pick another model." % (model_name(e.model), wait_text(e.wait)))
     if isinstance(e, urllib.error.HTTPError):
         try:
             msg = json.loads(e.read().decode()).get("error", {}).get("message", "")
@@ -91,15 +212,26 @@ def net_error(e):
         if e.code == 401:
             return "API key rejected (401). Use /key to enter a new one."
         if e.code == 429:
-            return "Rate limited by the AI service (429). Wait a moment and try again."
+            return "The AI service's free limit is used up for a moment. Wait a little and try again, or pick another model."
+        if e.code == 413:
+            return "That request was too big for the free plan. Start a new chat (/new) and try again."
         return "AI service error %d: %s" % (e.code, msg or e.reason)
     reason = getattr(e, "reason", e)
     return ("No connection to the AI (%s).\nCheck the network cable / VM network, then try again. /net shows status." % reason)
 
 
 def open_chat(key, model, messages):
-    """Start a streamed reply (raises urllib errors when the service can't be reached)."""
-    return api_req("/chat/completions", key, {"model": model, "messages": messages, "stream": True}, timeout=90)
+    """Start a streamed reply. Raises RateLimited when the model's free limit is used up, and
+    urllib errors when the service can't be reached."""
+    body = {"model": model, "messages": messages, "stream": True, "max_completion_tokens": 8192}
+    if model.startswith("openai/gpt-oss"):
+        body["reasoning_effort"] = "low"   # far fewer hidden 'thinking' tokens: replies start sooner, the limit lasts longer
+    try:
+        return api_req("/chat/completions", key, body, timeout=90)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise _rate_limited(e, model)
+        raise
 
 
 def iter_chat(resp, stop=None):
@@ -130,9 +262,43 @@ def list_models(key):
     return sorted(m["id"] for m in json.load(api_req("/models", key, timeout=20)).get("data", []))
 
 
+def compact_reply(text):
+    """An earlier AI reply without the files it wrote: they are saved in the apps folder, and the
+    free limit counts every token sent, so old code isn't sent again and again."""
+    return FILE_RE.sub(lambda m: "[wrote %s, %d lines; it is saved in the apps folder]"
+                       % (safe_name(m.group(1)), m.group(2).count("\n") + 1), text)
+
+
+def with_files(text, history):
+    """The newest message, plus the current text of the app files it names (so the AI changes what
+    is really in them, edits included). 'Make it faster' with no name gets the last file written."""
+    if "\nHere is " in text or "\nCurrent " in text:          # /send and fix requests attach files already
+        return text
+    names = [n for n, _ in list_apps() if not n.endswith((".exe", ".iso"))
+             and re.search(r"(?<![\w.])%s(?![\w])" % re.escape(n), text)]
+    if not names:
+        for h in reversed(history[:-1]):
+            if h["role"] == "assistant":
+                written = [safe_name(n) for n, _ in FILE_RE.findall(h["content"])]
+                if written and len(text) < 200:
+                    names = [written[-1]]
+                break
+    for n in names[:2]:
+        t = file_text(os.path.join(APPS, n), limit=8000)
+        if t is not None:
+            text += "\n\n(The current %s:)\n%s" % (n, t)
+    return text
+
+
 def chat_messages(history, gui=False):
-    """The messages to send: the system prompt (with the current apps) and the recent history."""
-    return [{"role": "system", "content": (SYSTEM_GUI if gui else SYSTEM) + file_list_note()}] + history[-MAX_MSGS:]
+    """The messages to send: the system prompt (with the current apps) and the recent history,
+    kept small because the free plan counts every token."""
+    recent = history[-HISTORY:]
+    msgs = [{"role": h["role"], "content": compact_reply(h["content"]) if h["role"] == "assistant" else h["content"]}
+            for h in recent]
+    if msgs and msgs[-1]["role"] == "user":
+        msgs[-1]["content"] = with_files(msgs[-1]["content"], recent)
+    return [{"role": "system", "content": (SYSTEM_GUI if gui else SYSTEM) + file_list_note()}] + msgs
 
 
 # ---------------------------------------------------------------------------- files the AI writes

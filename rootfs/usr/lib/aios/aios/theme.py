@@ -73,9 +73,18 @@ def font(role="regular", size=15):
     return f
 
 
+_text_cache = {}
+
+
 def text(surface, s, pos, role="regular", size=15, color=None, anchor="topleft"):
-    """Draw one line of text; anchor is any pygame.Rect position name. Returns its Rect."""
-    img = font(role, size).render(s, True, color or C["text"])
+    """Draw one line of text; anchor is any pygame.Rect position name. Returns its Rect.
+    Rendered lines are kept, so redrawing the same screen doesn't render them again."""
+    key = (s, role, size, color or C["text"], _scale)
+    img = _text_cache.get(key)
+    if img is None:
+        if len(_text_cache) > 3000:
+            _text_cache.clear()
+        img = _text_cache[key] = font(role, size).render(s, True, color or C["text"])
     r = img.get_rect(**{anchor: pos})
     surface.blit(img, r)
     return r
@@ -113,10 +122,14 @@ def panel(surface, rect, color=None, radius=12, border=None, shadow=False):
     rect = pygame.Rect(rect)
     r = px(radius)
     if shadow:
-        sh = pygame.Surface((rect.w + px(24), rect.h + px(24)), pygame.SRCALPHA)
-        for i in range(6):
-            a = 10 + i * 4
-            pygame.draw.rect(sh, (0, 0, 0, a), sh.get_rect().inflate(-i * px(4), -i * px(4)), border_radius=r + px(8))
+        key = ("shadow", rect.w, rect.h, r)
+        sh = _shape_cache.get(key)
+        if sh is None:
+            sh = pygame.Surface((rect.w + px(24), rect.h + px(24)), pygame.SRCALPHA)
+            for i in range(6):
+                a = 10 + i * 4
+                pygame.draw.rect(sh, (0, 0, 0, a), sh.get_rect().inflate(-i * px(4), -i * px(4)), border_radius=r + px(8))
+            _keep(key, sh)
         surface.blit(sh, (rect.x - px(12), rect.y - px(6)))
     pygame.draw.rect(surface, color or C["panel"], rect, border_radius=r)
     if border:
@@ -124,9 +137,24 @@ def panel(surface, rect, color=None, radius=12, border=None, shadow=False):
     return rect
 
 
+_shape_cache = {}
+
+
+def _keep(key, surf):
+    if len(_shape_cache) > 400:
+        _shape_cache.clear()
+    _shape_cache[key] = surf
+
+
 def gradient_rect(surface, rect, c1, c2, radius=0, horizontal=True):
-    """A rectangle filled with a two-colour gradient (rounded corners if radius > 0)."""
+    """A rectangle filled with a two-colour gradient (rounded corners if radius > 0).
+    Each size and colour pair is drawn once and then reused."""
     rect = pygame.Rect(rect)
+    key = ("grad", rect.size, tuple(c1), tuple(c2), radius, horizontal, _scale)
+    g = _shape_cache.get(key)
+    if g is not None:
+        surface.blit(g, rect)
+        return
     g = pygame.Surface(rect.size, pygame.SRCALPHA)
     n = rect.w if horizontal else rect.h
     for i in range(max(1, n)):
@@ -140,6 +168,7 @@ def gradient_rect(surface, rect, c1, c2, radius=0, horizontal=True):
         mask = pygame.Surface(rect.size, pygame.SRCALPHA)
         pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=px(radius))
         g.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+    _keep(key, g)
     surface.blit(g, rect)
 
 

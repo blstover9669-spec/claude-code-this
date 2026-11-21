@@ -106,6 +106,12 @@ it is used automatically; otherwise AI OS asks for it on first boot (`/key` chan
 An ISO built with a key contains that key, so only share such an ISO with people you trust,
 and never commit a key to this repository.
 
+**Models and the free limit.** Click the model name at the top right of the chat (or type
+`/model`) to pick one: GPT-OSS 120B (smartest), GPT-OSS 20B (fast), Qwen 3.8 27B, ALLaM 2 7B.
+Groq's free plan allows each model about 8,000 tokens a minute. AI OS keeps requests small
+(earlier code isn't re-sent; a file's current text is attached only when you mention it), waits
+out a limit of a few seconds, and otherwise lets another model answer, saying so in the chat.
+
 ## Building the ISO
 
 Needs a Linux machine with root, `curl`, `cpio`, `zstd`, `xorriso`, `mtools` and GRUB

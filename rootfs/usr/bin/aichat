@@ -80,6 +80,46 @@ def chat_stream(key, model, messages):
         except Exception: pass
     return "".join(out)
 
+def ask_ai(key, model, msgs):
+    """chat_stream, but when the model's free limit is used up: wait a few seconds, or let another
+    model answer (each model has its own free limit). Raises RateLimited when none can."""
+    tried, waits = set(), 0
+    use = model if core.limited_for(model) == 0 else (core.backup_model(model) or model)
+    while True:
+        try:
+            return chat_stream(key, use, core.chat_messages(msgs))
+        except core.RateLimited as e:
+            tried.add(use)
+            if e.wait <= 12 and not e.daily and waits < 2:
+                waits += 1
+                info("%s's free limit is used up for a moment. Trying again in %s..."
+                     % (core.model_name(use), core.wait_text(e.wait)))
+                time.sleep(e.wait + 0.5)
+                continue
+            nxt = core.backup_model(use, [m for m, _, _ in core.MODELS if m not in tried])
+            if nxt is None:
+                raise
+            info("%s hit its free limit (back in %s), so %s is answering."
+                 % (core.model_name(use), core.wait_text(e.wait), core.model_name(nxt)))
+            use, waits = nxt, 0
+
+
+def model_cmd(key, model, rest):
+    """/model: list the chat models; /model N or /model NAME switches (and remembers it)."""
+    models = core.chat_models(key)
+    if rest:
+        pick = models[int(rest) - 1] if rest.isdigit() and 1 <= int(rest) <= len(models) else rest
+        core.save_model(pick)
+        info("model: %s" % core.model_name(pick))
+        return pick
+    for i, m in enumerate(models, 1):
+        wait = core.limited_for(m)
+        note = ("free limit used up, back in " + core.wait_text(wait)) if wait else core.model_blurb(m)
+        print("%s%d. %-14s %s" % ("* " if m == model else "  ", i, core.model_name(m), col("dim", note)))
+    info("current: %s   (/model NUMBER to switch; each model has its own free limit)" % core.model_name(model))
+    return model
+
+
 # ---------------------------------------------------------------- files
 def save_files(text):
     return core.save_files(text, lambda n: print(col("gr", "[saved apps/%s]" % n) + "  type " + col("b", "/run " + n)))
@@ -345,7 +385,7 @@ def main():
     banner()
     wait_for_network()
     key = load_key() or ask_key()
-    model = MODEL
+    model = core.load_model()
     msgs = []
     pending = None  # message to send to the AI without typing (fix requests)
     while True:
@@ -382,13 +422,7 @@ def main():
                 elif cmd == "edit": edit_file(rest)
                 elif cmd == "iso": make_iso(rest)
                 elif cmd in ("new", "reset"): msgs = []; banner(); info("New conversation.")
-                elif cmd == "model":
-                    if rest: model = rest; info("model: " + model)
-                    else:
-                        try:
-                            for i in core.list_models(key): print(("* " if i == model else "  ") + i)
-                        except Exception as e: err(net_error(e))
-                        info("current: %s   (/model NAME to switch)" % model)
+                elif cmd == "model": model = model_cmd(key, model, rest)
                 elif cmd == "net": net_status()
                 elif cmd in ("wifi", "wlan"): wifi_cmd(rest)
                 elif cmd == "key":
@@ -403,7 +437,7 @@ def main():
             msgs.append({"role": "user", "content": line})
             msgs = msgs[-MAX_MSGS:]
             try:
-                reply = chat_stream(key, model, core.chat_messages(msgs))
+                reply = ask_ai(key, model, msgs)
             except KeyboardInterrupt:
                 print(col("dim", "[stopped]")); msgs.pop(); continue
             except (urllib.error.URLError, OSError) as e:

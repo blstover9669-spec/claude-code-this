@@ -81,9 +81,7 @@ class Dialog:
         self.app.dirty = True
 
     def draw(self, s):
-        dim = pygame.Surface((self.app.W, self.app.H), pygame.SRCALPHA)
-        dim.fill((5, 6, 10, 170))
-        s.blit(dim, (0, 0))
+        s.blit(self.app.dim(), (0, 0))
         r = self.rect()
         T.panel(s, r, T.C["panel"], 16, T.C["line"], shadow=True)
         self.buttons = []
@@ -212,6 +210,7 @@ class KeyDialog(Dialog):
             self.note = "Type or paste the key first."
             return
         self.app.key = k
+        threading.Thread(target=self.app._load_models, daemon=True).start()
         try:
             core.save_key(k)
             self.app.toast("API key saved", "ok", "check")
@@ -481,6 +480,54 @@ class NewFileDialog(Dialog):
         self.app.edit_app(n, create=True)
 
 
+class ModelMenu(Dialog):
+    """Pick the AI model: a list under the model name at the top right (also /model, and Settings)."""
+    width, title, icon = 440, "AI model", "sparkle"
+
+    def rect(self):
+        w = T.px(self.width)
+        return pygame.Rect(self.app.W - w - T.px(20), T.px(52), w, self.height())
+
+    def height(self):
+        return T.px(64 + 16 + 30) + len(self.app.models) * T.px(62)
+
+    def draw(self, s):
+        # no dimmed screen: it's a menu under the button, the chat stays visible
+        r = self.rect()
+        T.panel(s, r, T.C["panel"], 14, T.C["line"], shadow=True)
+        self.buttons = []
+        T.icon(s, self.icon, (r.x + T.px(20), r.y + T.px(20), T.px(20), T.px(20)), T.C["accent"])
+        T.text(s, self.title, (r.x + T.px(50), r.y + T.px(18)), "semibold", 16)
+        cb = pygame.Rect(r.right - T.px(46), r.y + T.px(12), T.px(32), T.px(32))
+        T.icon(s, "close", cb.inflate(-T.px(12), -T.px(12)), T.C["text2"])
+        self.buttons.append((cb, self.close, "close"))
+        y = r.y + T.px(58)
+        for m in self.app.models:
+            row = pygame.Rect(r.x + T.px(10), y, r.w - T.px(20), T.px(58))
+            cur = m == self.app.model
+            key = ("model", m)
+            if cur or self.hover == key:
+                T.panel(s, row, T.C["panel2"], 10, T.C["accent"] if cur else None)
+            pygame.draw.circle(s, T.C["accent"] if cur else T.C["line"], (row.x + T.px(20), row.y + T.px(20)), T.px(7),
+                               0 if cur else max(1, T.px(2)))
+            T.text(s, core.model_name(m), (row.x + T.px(40), row.y + T.px(9)), "semibold", 15,
+                   T.C["text"] if cur else T.C["text2"])
+            wait = core.limited_for(m)
+            note = ("Free limit used up, back in " + core.wait_text(wait)) if wait else (core.model_blurb(m) or m)
+            T.text(s, note, (row.x + T.px(40), row.y + T.px(32)), "regular", 12, T.C["warn"] if wait else T.C["muted"])
+            self.buttons.append((row, lambda m=m: (self.app.set_model(m), self.close()), key))
+            y += T.px(62)
+        T.text(s, "Each model has its own free limit.", (r.x + T.px(20), r.bottom - T.px(28)), "regular", 12, T.C["muted"])
+
+    def on_key(self, ev):
+        ms = self.app.models
+        if ev.key in ("up", "down") and ms:
+            i = ms.index(self.app.model) if self.app.model in ms else 0
+            self.app.set_model(ms[(i + (1 if ev.key == "down" else -1)) % len(ms)])
+        elif ev.key == "return":
+            self.close()
+
+
 class HelpDialog(Dialog):
     width, title, icon = 640, "Commands and shortcuts", "terminal"
 
@@ -514,8 +561,9 @@ class SettingsDialog(Dialog):
 
     def _load(self):
         try:
-            models = [m for m in core.list_models(self.app.key) if "whisper" not in m and "orpheus" not in m
-                      and "guard" not in m]
+            models = [m for m in core.list_models(self.app.key) if core.is_chat_model(m)]
+            order = [m for m, _, _ in core.MODELS]
+            models.sort(key=lambda m: (order.index(m) if m in order else len(order), m))
             self.app.post(self._loaded, models, "")
         except Exception as e:
             self.app.post(self._loaded, [], core.net_error(e) if isinstance(e, (urllib.error.URLError, OSError)) else str(e))
@@ -549,8 +597,13 @@ class SettingsDialog(Dialog):
                     T.panel(s, row, T.C["panel2"], 8, T.C["accent"] if cur else None)
                 pygame.draw.circle(s, T.C["accent"] if cur else T.C["line"], (row.x + T.px(18), row.centery), T.px(6),
                                    0 if cur else max(1, T.px(2)))
-                T.text(s, m, (row.x + T.px(36), row.centery), "medium" if cur else "regular", 14,
-                       T.C["text"] if cur else T.C["text2"], anchor="midleft")
+                t = T.text(s, core.model_name(m), (row.x + T.px(36), row.centery), "medium" if cur else "regular", 14,
+                           T.C["text"] if cur else T.C["text2"], anchor="midleft")
+                wait = core.limited_for(m)
+                note = ("free limit used up, back in " + core.wait_text(wait)) if wait else core.model_blurb(m)
+                if note:
+                    T.text(s, note, (t.right + T.px(12), row.centery), "regular", 12, T.C["warn"] if wait else T.C["muted"],
+                           anchor="midleft")
                 self.buttons.append((row, lambda m=m: self.pick(m), key))
                 y += T.px(38)
         y += T.px(16)
@@ -561,8 +614,7 @@ class SettingsDialog(Dialog):
                         lambda: self.app.open(KeyDialog(self.app)), icon="gear")
 
     def pick(self, m):
-        self.app.model = m
-        self.app.toast("Model: " + m, "ok", "check")
+        self.app.set_model(m)
 
     def on_wheel(self, ev):
         self.top = max(0, self.top - ev.dy)
@@ -802,9 +854,7 @@ class TermWindow:
         return pygame.Rect((self.app.W - w) // 2, max(T.px(10), (self.app.H - h) // 2), w, h)
 
     def draw(self, s):
-        dim = pygame.Surface((self.app.W, self.app.H), pygame.SRCALPHA)
-        dim.fill((5, 6, 10, 150))
-        s.blit(dim, (0, 0))
+        s.blit(self.app.dim(), (0, 0))
         r = self.rect()
         T.panel(s, r, T.C["term_bg"], 14, T.C["line"], shadow=True)
         bar = pygame.Rect(r.x, r.y, r.w, T.px(40))
@@ -954,7 +1004,14 @@ class App:
         self.W, self.H = size
         T.set_scale(size)
         self.key = core.load_key()
-        self.model = core.MODEL
+        self.model = core.load_model()
+        self.models = [m for m, _, _ in core.MODELS]   # replaced by the key's own list once it arrives
+        self.answered_by = None      # the backup model that answered last, while the chosen one is limited
+        self.clean = None            # the last frame without the pointer (moving the pointer redraws only it)
+        self.pointer_rect = None
+        self.pointer_moved = False
+        self.last_draw = 0.0
+        self._dim = None
         self.msgs = [Msg("welcome")]
         self.history = []
         self.box = W.TextBox("Message AI OS…  (/help for commands)", multiline=True)
@@ -1011,6 +1068,15 @@ class App:
     def chip(self, text, kind="info", icon=None):
         return self.add(Msg("chip", text, kind=kind, icon=icon))
 
+    def chip_before(self, msg, text, kind="info", icon=None):
+        """A status line just above `msg` (e.g. why a different model is answering this reply)."""
+        c = Msg("chip", text, kind=kind, icon=icon)
+        if msg in self.msgs:
+            self.msgs.insert(self.msgs.index(msg), c)
+            self.dirty = True
+            return c
+        return self.add(c)
+
     def refresh_apps(self):
         self.apps = core.list_apps()
         self.dirty = True
@@ -1037,11 +1103,34 @@ class App:
         threading.Thread(target=self._stream, args=(ai, snapshot, self.model, self.key, stop), daemon=True).start()
 
     def _stream(self, msg, history, model, key, stop):
-        try:
-            resp = core.open_chat(key, model, core.chat_messages(history, gui=True))
-        except Exception as e:
-            self.post(self._stream_end, msg, e)
-            return
+        # Each model has its own free limit. A short wait is waited out; otherwise another model answers.
+        tried, waits = set(), 0
+        use = model if core.limited_for(model) == 0 else (core.backup_model(model, self.models) or model)
+        while True:
+            try:
+                resp = core.open_chat(key, use, core.chat_messages(history, gui=True))
+                break
+            except core.RateLimited as e:
+                tried.add(use)
+                if e.wait <= 12 and not e.daily and waits < 2:
+                    waits += 1
+                    self.post(self.chip_before, msg, "%s's free limit is used up for a moment. Trying again in %s…"
+                              % (core.model_name(use), core.wait_text(e.wait)), "warn", "warn")
+                    if stop.wait(e.wait + 0.5):
+                        self.post(self._stream_end, msg, None)
+                        return
+                    continue
+                nxt = core.backup_model(use, [m for m in self.models if m not in tried])
+                if nxt is None:
+                    self.post(self._stream_end, msg, e)
+                    return
+                self.post(self.chip_before, msg, "%s hit its free limit (back in %s), so %s is answering."
+                          % (core.model_name(use), core.wait_text(e.wait), core.model_name(nxt)), "warn", "sparkle")
+                use, waits = nxt, 0
+            except Exception as e:
+                self.post(self._stream_end, msg, e)
+                return
+        self.post(setattr, self, "answered_by", use if use != model else None)
         try:
             for t in core.iter_chat(resp, stop):
                 self.post(self._delta, msg, t)
@@ -1154,10 +1243,9 @@ class App:
             self.dirty = True
         elif cmd == "model":
             if rest:
-                self.model = rest
-                self.chip("model: " + rest, "ok", "sparkle")
+                self.set_model(rest)
             else:
-                self.open(SettingsDialog(self))
+                self.open(ModelMenu(self))
         elif cmd == "net":
             self.net_card()
         elif cmd in ("wifi", "wlan"):
@@ -1176,6 +1264,20 @@ class App:
             self.power("poweroff")
         else:
             self.chip("Unknown command. /help lists commands.", "err", "warn")
+
+    def set_model(self, m):
+        """Use this model from now on (remembered across restarts of the chat)."""
+        self.model = m
+        self.answered_by = None
+        core.save_model(m)
+        self.toast("Model: " + core.model_name(m), "ok", "sparkle")
+
+    def _load_models(self):
+        if not self.key:
+            return
+        models = core.chat_models(self.key)
+        if models:
+            self.post(setattr, self, "models", models)
 
     def new_chat(self):
         self.stop_reply()
@@ -1396,7 +1498,7 @@ class App:
     # ---------------------------------------------------------------- events
     def handle(self, ev):
         if ev.type == "mouse_move" and self.input is not None and self.input.mouse_seen:
-            self.dirty = True if self.game is None else self.dirty
+            self.pointer_moved = True      # just the pointer: redrawn on its own unless a hover changes
         if self.game is not None:
             try:
                 self.game.handle(ev)
@@ -1526,8 +1628,14 @@ class App:
             if layer is not None:
                 layer.draw(s)
         self.draw_toasts(s)
-        if self.input is not None and self.input.mouse_seen:
-            T.draw_pointer(s, self.input.mouse_pos)
+        # (the pointer is drawn by step(), so moving it doesn't need a whole new frame)
+
+    def dim(self):
+        """The see-through dark layer behind dialogs (made once, not every frame)."""
+        if self._dim is None or self._dim.get_size() != (self.W, self.H):
+            self._dim = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
+            self._dim.fill((5, 6, 10, 170))
+        return self._dim
 
     def draw_sidebar(self, s):
         sw = self.sidebar_w()
@@ -1592,8 +1700,9 @@ class App:
         col = T.C["ok"] if self.online else T.C["muted"]
         pygame.draw.circle(s, col, (pad + T.px(4), fy), T.px(4))
         T.text(s, "Online" if self.online else "Offline", (pad + T.px(16), fy), "medium", 12, col, anchor="midleft")
-        T.text(s, W.ellipsize(self.model.split("/")[-1], T.font("regular", 11), T.px(150)), (sw - pad, fy), "regular", 11,
-               T.C["muted"], anchor="midright")
+        mr = T.text(s, W.ellipsize(core.model_name(self.model), T.font("regular", 11), T.px(150)), (sw - pad, fy), "regular", 11,
+                    T.C["text2"] if self.hover == "modelfoot" else T.C["muted"], anchor="midright")
+        self.hits.append((mr.inflate(T.px(10), T.px(12)), lambda: self.open(ModelMenu(self)), "modelfoot"))
 
     def app_menu(self, name, row):
         kind = core.kind_of(name)
@@ -1637,7 +1746,11 @@ class App:
         T.text(s, W.ellipsize(title, T.font("semibold", 16), m.w - T.px(360)), (m.x + T.px(28), T.px(30)), "semibold", 16,
                anchor="midleft")
         x = m.right - T.px(24)
-        r = W.pill(s, (x, T.px(30)), self.model.split("/")[-1], T.C["accent"], "sparkle", anchor="midright")
+        label = core.model_name(self.model)
+        if self.answered_by:                       # the chosen model is at its free limit; a backup answers
+            label = "%s (now %s)" % (label, core.model_name(self.answered_by))
+        r = W.pill(s, (x, T.px(30)), label + "  ▼", T.C["accent"], "sparkle", anchor="midright")
+        self.hits.append((r.inflate(T.px(6), T.px(10)), lambda: self.open(ModelMenu(self)), "modelpill"))
         if self.stream:
             dots = "." * (1 + int(time.monotonic() * 3) % 3)
             label = ("Writing" if self.stream[0].text else "Thinking") + dots
@@ -1823,8 +1936,8 @@ class App:
         if self.stick_bottom:
             self.scroll_target = mx
         self.scroll_target = min(self.scroll_target, mx)
-        if abs(self.scroll - self.scroll_target) < 1:
-            self.scroll = self.scroll_target
+        if abs(self.scroll - self.scroll_target) < 1 or (self.stream and self.stick_bottom):
+            self.scroll = self.scroll_target   # while a reply streams in, follow it without an animation
         else:
             self.scroll += (self.scroll_target - self.scroll) * 0.35
         clip = s.get_clip()
@@ -1902,10 +2015,34 @@ class App:
                     or abs(self.scroll - self.scroll_target) >= 1
                     or any(m.kind == "busy" for m in self.msgs[-3:]))
 
+    def frame_interval(self):
+        """How often the screen must be redrawn even with nothing new (None: only on changes).
+        Redrawing the whole screen is the expensive part on slow or virtual graphics, so it is
+        done only as often as what's moving needs."""
+        if self.game is not None:
+            return 1 / 60
+        if abs(self.scroll - self.scroll_target) >= 1:
+            return 1 / 45                                  # smooth scrolling
+        if self.stream:
+            return 1 / 12                                  # the reply as it streams in, thinking dots
+        now = time.monotonic()
+        if any(now - t[3] > 3.3 for t in self.toasts):
+            return 1 / 15                                  # a notification fading out
+        if self.toasts or any(m.kind == "busy" for m in self.msgs[-3:]):
+            return 1 / 8
+        if self.box.text or self.dialog is not None or self.term is not None:
+            return 0.5                                     # blinking text cursors
+        return None
+
     def step(self, timeout=None):
         """One pass of the main loop: input, background results, periodic checks, drawing."""
+        interval = self.frame_interval()
         if timeout is None:
-            timeout = 0.016 if self.game is not None else (0.03 if self.animating() else 0.4)
+            timeout = 0.016 if self.game is not None else min(0.5, interval or 0.5)
+            if self.dirty or self.pointer_moved:
+                timeout = 0.0
+            elif interval is not None:
+                timeout = max(0.0, min(timeout, self.last_draw + interval - time.monotonic()))
         for ev in self.input.poll(timeout):
             self.handle(ev)
         while True:
@@ -1932,12 +2069,39 @@ class App:
                 threading.Thread(target=self._wifi_poll, daemon=True).start()
             if len(self.apps) != len(core.list_apps()):
                 self.refresh_apps()
-        if self.animating() or self.box.text or self.dialog is not None:
-            self.dirty = True          # blinking cursors, thinking dots, smooth scrolling
+        interval = self.frame_interval()
+        if interval is not None and now - self.last_draw >= interval:
+            self.dirty = True          # blinking cursors, thinking dots, smooth scrolling, games
         if self.dirty:
             self.draw(self.surface)
+            if self.game is None and self.input is not None and self.input.mouse_seen:
+                self.clean = self.surface.copy()          # this frame without the pointer
+                self.pointer_rect = self.draw_pointer()
+            else:
+                self.clean = None
             self.display.flip()
-            self.dirty = False
+            self.dirty = self.pointer_moved = False
+            self.last_draw = now
+        elif self.pointer_moved:
+            self.move_pointer()
+            self.pointer_moved = False
+
+    def draw_pointer(self):
+        x, y = self.input.mouse_pos
+        T.draw_pointer(self.surface, (x, y))
+        return pygame.Rect(x - T.px(2), y - T.px(2), T.px(18), T.px(26))
+
+    def move_pointer(self):
+        """Only the pointer moved: put back what was under it, draw it at the new place and send
+        just those two small areas to the screen (instead of the whole frame)."""
+        if self.clean is None or self.pointer_rect is None:
+            self.dirty = True
+            return
+        old = self.pointer_rect
+        self.surface.blit(self.clean, old, old)
+        new = self.draw_pointer()
+        self.pointer_rect = new
+        self.display.flip([old, new])
 
     def _wifi_poll(self):
         connected, kv = core.wifi_status()
@@ -1949,6 +2113,7 @@ class App:
         self.display = disp
         self.surface = disp.surface
         self.input = display.Input(disp.size)
+        threading.Thread(target=self._load_models, daemon=True).start()
 
     def run(self):
         while not self.quit:
