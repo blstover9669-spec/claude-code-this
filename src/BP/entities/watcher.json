@@ -1,0 +1,34 @@
+{
+  "format_version": "1.21.0",
+  "minecraft:entity": {
+    "description": {
+      "identifier": "hollow:watcher",
+      "is_spawnable": true,
+      "is_summonable": true,
+      "is_experimental": false
+    },
+    "components": {
+      "minecraft:type_family": { "family": ["hollow", "monster", "mob"] },
+      "minecraft:health": { "value": 200, "max": 200 },
+      "minecraft:collision_box": { "width": 0.6, "height": 2.9 },
+      "minecraft:physics": {},
+      "minecraft:pushable": { "is_pushable": false, "is_pushable_by_piston": false },
+      "minecraft:knockback_resistance": { "value": 1.0 },
+      "minecraft:fire_immune": true,
+      "minecraft:movement": { "value": 0.0 },
+      "minecraft:damage_sensor": {
+        "triggers": [ { "cause": "all", "deals_damage": false } ]
+      },
+      "minecraft:behavior.look_at_player": {
+        "priority": 0,
+        "look_distance": 96,
+        "probability": 1.0,
+        "angle_of_view_horizontal": 360,
+        "angle_of_view_vertical": 360,
+        "look_time": [400, 400]
+      },
+      "minecraft:nameable": { "always_show": false, "allow_name_tag_renaming": false },
+      "minecraft:persistent": {}
+    }
+  }
+}

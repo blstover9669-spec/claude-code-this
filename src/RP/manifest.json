@@ -1,0 +1,16 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "The Hollow §8[RP]",
+    "description": "Something pale watches from the treeline. Don't look away.",
+    "uuid": "81f31d6b-b9ad-43cd-a04c-39e5e3f33847",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 0]
+  },
+  "modules": [
+    { "type": "resources", "uuid": "85877e50-cbcf-4f88-831a-73618bf39eb0", "version": [1, 0, 0] }
+  ],
+  "dependencies": [
+    { "uuid": "9bb55158-8f6c-4eb4-86de-995d9d2f7db5", "version": [1, 0, 0] }
+  ]
+}

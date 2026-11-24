@@ -1,0 +1,18 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "The Hollow §8[BP]",
+    "description": "Something pale watches from the treeline. Don't look away.",
+    "uuid": "9bb55158-8f6c-4eb4-86de-995d9d2f7db5",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 0]
+  },
+  "modules": [
+    { "type": "data", "uuid": "f46d9cf8-a8b3-40eb-8f6b-a8cbccac25b2", "version": [1, 0, 0] },
+    { "type": "script", "language": "javascript", "uuid": "225f0f65-ba37-410c-ac1b-1f5ecf8b787b", "entry": "scripts/main.js", "version": [1, 0, 0] }
+  ],
+  "dependencies": [
+    { "module_name": "@minecraft/server", "version": "1.11.0" },
+    { "uuid": "81f31d6b-b9ad-43cd-a04c-39e5e3f33847", "version": [1, 0, 0] }
+  ]
+}
