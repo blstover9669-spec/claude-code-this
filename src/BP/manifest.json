@@ -1,18 +1,18 @@
 {
   "format_version": 2,
   "header": {
-    "name": "The Hollow §8[BP]",
-    "description": "Something pale watches from the treeline. Don't look away.",
-    "uuid": "9bb55158-8f6c-4eb4-86de-995d9d2f7db5",
+    "name": "Last Night §8[BP]",
+    "description": "Everything you do after dark is remembered. Tomorrow night, it happens again.",
+    "uuid": "35239279-c74b-4fd9-aeff-30f8ca67cf92",
     "version": [1, 0, 0],
     "min_engine_version": [1, 21, 0]
   },
   "modules": [
-    { "type": "data", "uuid": "f46d9cf8-a8b3-40eb-8f6b-a8cbccac25b2", "version": [1, 0, 0] },
-    { "type": "script", "language": "javascript", "uuid": "225f0f65-ba37-410c-ac1b-1f5ecf8b787b", "entry": "scripts/main.js", "version": [1, 0, 0] }
+    { "type": "data", "uuid": "4ef489d9-6781-4cd2-a877-08509a53a27f", "version": [1, 0, 0] },
+    { "type": "script", "language": "javascript", "uuid": "0a5e48a4-7fed-4505-b91b-924492054b8d", "entry": "scripts/main.js", "version": [1, 0, 0] }
   ],
   "dependencies": [
     { "module_name": "@minecraft/server", "version": "1.11.0" },
-    { "uuid": "81f31d6b-b9ad-43cd-a04c-39e5e3f33847", "version": [1, 0, 0] }
+    { "uuid": "419a266a-9093-4b83-bae5-b8c60a064da6", "version": [1, 0, 0] }
   ]
 }

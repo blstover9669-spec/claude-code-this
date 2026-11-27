@@ -1,349 +1,425 @@
-// The Hollow — a stalker that only moves when you are not looking.
+// LAST NIGHT
 //
-//  * At night it appears far behind you, at the edge of your vision.
-//  * While it is on your screen it stays frozen.
-//  * Look away and it creeps closer.
-//  * Stare straight at it for a few seconds and it fades away... for now.
-//  * Let it reach you and it will be in your face when you turn around.
+// Everything you do after dark is written down: every step, every glance,
+// every block you break. The next night it happens again. A faded copy of you
+// walks your old path at the exact time you walked it. It does not see you,
+// and it does not chase you. It is just remembering.
+//
+// But you keep going back to the same places. And if you are standing where
+// you stood last night when it gets there, you trade places with your past.
 
 import { world, system } from "@minecraft/server";
 
-const ID = "hollow:watcher";
-const TICK_RATE = 10; // logic runs every 10 game ticks (0.5s)
+const ECHO = "lastnight:echo";
+const NIGHT_START = 13000;
+const NIGHT_END = 23000;
+const SAMPLE = 10;                                   // ticks per recorded sample
+const SLOTS = (NIGHT_END - NIGHT_START) / SAMPLE;    // 1000 samples per night
+const CHUNK = 30000;                                 // dynamic property string limit is 32767
+const TOUCH_DIST = 1.3;
+const TOUCH_TICKS = 8;                               // x2 ticks (~0.8 s overlap to desync)
+const RING_SIZE = 240;                               // last 2 minutes, for /scriptevent test
 
-const CFG = {
-  spawnCheckEvery: 200,      // ticks between spawn rolls per player
-  spawnChance: 0.25,
-  cooldownAfterEncounter: 1800,
-  spawnDistMin: 26,
-  spawnDistMax: 38,
-  creepEvery: 3,             // unseen intervals between creeps (x0.5s)
-  creepStep: 5,
-  attackRange: 4.5,
-  stareToBanish: 8,          // intervals (x0.5s) of direct stare
-  onScreenDot: 0.80,         // ~37 deg: counts as "in view"
-  stareDot: 0.975,           // ~13 deg: counts as "staring"
-  jumpscareDamage: 6,
-  ambientMin: 900,
-  ambientMax: 2400,
-};
+/** playerId -> { rec, past, replay, ring, warned } */
+const states = new Map();
 
-/** watcherId -> state */
-const stalkers = new Map();
-/** playerId -> { nextSpawnRoll, cooldownUntil, nextAmbient } */
-const players = new Map();
-
-const WHISPERS = [
-  "§7§o...it's behind you...",
-  "§7§odon't turn around",
-  "§7§oyou left the door open",
-  "§7§owe see you",
-  "§7§owhy are you still awake?",
-  "§7§okeep looking. keep looking.",
-  "§8§o...h e l l o...",
-];
-
-// ---------- helpers ----------
+// ---------------------------------------------------------------- helpers
 
 const valid = (e) => {
-  try {
-    if (!e) return false;
-    return typeof e.isValid === "function" ? e.isValid() : e.isValid;
-  } catch { return false; }
+  try { return !!e && (typeof e.isValid === "function" ? e.isValid() : e.isValid); } catch { return false; }
 };
-const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
-const len = (v) => Math.hypot(v.x, v.y, v.z);
-const norm = (v) => { const l = len(v) || 1; return { x: v.x / l, y: v.y / l, z: v.z / l }; };
-const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
-const rand = (a, b) => a + Math.random() * (b - a);
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+const r1 = (n) => Math.round(n * 10);
+const tod = () => world.getTimeOfDay();
+const isNight = () => { const t = tod(); return t >= NIGHT_START && t < NIGHT_END; };
+const nightSlot = () => (tod() - NIGHT_START) / SAMPLE;
+const overworld = () => world.getDimension("overworld");
 
-const isNight = () => {
-  const t = world.getTimeOfDay();
-  return t >= 13000 && t <= 23000;
-};
-
-function run(entity, cmd) {
-  try {
-    if (typeof entity.runCommand === "function") entity.runCommand(cmd);
-    else entity.runCommandAsync(cmd);
-  } catch { /* command not available on this version */ }
+function lerpAngle(a, b, t) {
+  let d = ((b - a + 540) % 360) - 180;
+  return a + d * t;
 }
 
-function sound(player, id, opts = {}) {
-  try { player.playSound(id, opts); } catch { }
-}
-
-function particles(dim, loc, id = "minecraft:soul_particle", n = 8) {
-  for (let i = 0; i < n; i++) {
+function soundNear(dim, loc, id, opts = {}, radius = 48) {
+  for (const p of world.getAllPlayers()) {
     try {
-      dim.spawnParticle(id, { x: loc.x + rand(-0.4, 0.4), y: loc.y + rand(0, 2.8), z: loc.z + rand(-0.4, 0.4) });
-    } catch { return; }
+      if (p.dimension.id !== dim.id || dist(p.location, loc) > radius) continue;
+      p.playSound(id, { ...opts, location: loc });
+    } catch { }
   }
 }
 
-function isAir(b) {
-  if (!b) return false;
-  return b.isAir ?? b.typeId === "minecraft:air";
-}
-function isStandable(b) {
-  if (!b || isAir(b)) return false;
-  if (b.isLiquid) return false;
-  const t = b.typeId;
-  return !(t.includes("water") || t.includes("lava"));
+function setProp(e, key, value) {
+  try { e.setProperty(key, value); } catch { }
 }
 
-/** Finds a spot where the Hollow can stand near (x, z), scanning around yHint. */
-function findGround(dim, x, z, yHint, range = 14) {
+function place(e, pos, facing) {
+  try {
+    if (facing) e.teleport(pos, { facingLocation: facing });
+    else e.teleport(pos, { rotation: { x: pos.p ?? 0, y: pos.w ?? 0 } });
+  } catch {
+    try { e.teleport(pos); e.setRotation?.({ x: pos.p ?? 0, y: pos.w ?? 0 }); } catch { }
+  }
+}
+
+function digSound(kind) {
+  if (/log|plank|wood|fence|door|chest|table|bookshelf|stem|hyphae/.test(kind)) return "dig.wood";
+  if (/dirt|grass|farmland|mycelium|podzol|moss|leaves|clay/.test(kind)) return "dig.grass";
+  if (/sand|gravel|concrete_powder/.test(kind)) return "dig.gravel";
+  if (/glass|ice/.test(kind)) return "random.glass";
+  return "dig.stone";
+}
+
+function isAir(b) { return !!b && (b.isAir ?? b.typeId === "minecraft:air"); }
+
+function findGround(dim, x, z, yHint) {
   const bx = Math.floor(x), bz = Math.floor(z), y0 = Math.floor(yHint);
-  for (let dy = 0; dy <= range; dy++) {
+  for (let dy = 0; dy <= 12; dy++) {
     for (const y of dy === 0 ? [y0] : [y0 + dy, y0 - dy]) {
       try {
-        const feet = dim.getBlock({ x: bx, y, z: bz });
-        const head = dim.getBlock({ x: bx, y: y + 1, z: bz });
         const below = dim.getBlock({ x: bx, y: y - 1, z: bz });
-        if (isAir(feet) && isAir(head) && isStandable(below)) {
+        if (isAir(dim.getBlock({ x: bx, y, z: bz })) && isAir(dim.getBlock({ x: bx, y: y + 1, z: bz }))
+          && below && !isAir(below) && !below.typeId.includes("lava") && !below.typeId.includes("water")) {
           return { x: bx + 0.5, y, z: bz + 0.5 };
         }
-      } catch { return undefined; } // unloaded chunk / out of bounds
+      } catch { return undefined; }
     }
   }
   return undefined;
 }
 
-/** Returns { onScreen, staring, dist } for player -> hollow. */
-function viewState(player, hollow) {
-  const eye = player.getHeadLocation();
-  const target = { x: hollow.location.x, y: hollow.location.y + 2.4, z: hollow.location.z };
-  const to = sub(target, eye);
-  const dist = len(to);
-  const dir = norm(to);
-  const d = dot(dir, player.getViewDirection());
-  let visible = d >= CFG.onScreenDot;
-  if (visible) {
-    // blocked by terrain? then you can't actually see it
-    try {
-      const hit = player.dimension.getBlockFromRay(eye, dir, {
-        maxDistance: dist, includeLiquidBlocks: false, includePassableBlocks: false,
-      });
-      if (hit && hit.block && len(sub(hit.block.location, eye)) < dist - 1.5) visible = false;
-    } catch { }
+// ------------------------------------------------- night counter (persisted)
+
+function getNights() { return Number(world.getDynamicProperty("ln:nights") ?? 0); }
+
+// --------------------------------------------- recordings & persistence
+
+const newRec = (night) => ({ night, samples: new Array(SLOTS), breaks: [] });
+const sampleCount = (rec) => rec ? rec.samples.reduce((n, s) => n + (s ? 1 : 0), 0) : 0;
+
+function encode(rec) {
+  const parts = [];
+  rec.samples.forEach((s, i) => { if (s) parts.push(`${i},${s.join(",")}`); });
+  return parts.join("|");
+}
+function decode(night, str, breaksStr, len = SLOTS) {
+  const rec = { night, samples: new Array(len), breaks: [] };
+  if (str) for (const part of str.split("|")) {
+    const [i, x, y, z, p, w] = part.split(",").map(Number);
+    if (i >= 0 && i < len) rec.samples[i] = [x, y, z, p, w];
   }
-  return { onScreen: visible, staring: visible && d >= CFG.stareDot, dist };
+  if (breaksStr) for (const part of breaksStr.split("|")) {
+    const [s, x, y, z, k] = part.split(",");
+    rec.breaks.push([Number(s), Number(x), Number(y), Number(z), k]);
+  }
+  return rec;
 }
 
-function pstate(player) {
-  let s = players.get(player.id);
-  if (!s) {
-    const now = system.currentTick;
-    s = { nextSpawnRoll: now + CFG.spawnCheckEvery, cooldownUntil: 0, nextAmbient: now + rand(CFG.ambientMin, CFG.ambientMax) };
-    players.set(player.id, s);
-  }
-  return s;
+function save(player, key, rec) {
+  try {
+    const str = rec ? encode(rec) : "";
+    const n = Math.ceil(str.length / CHUNK);
+    const old = Number(player.getDynamicProperty(`ln:${key}:n`) ?? 0);
+    for (let i = 0; i < Math.max(n, old); i++) {
+      player.setDynamicProperty(`ln:${key}:${i}`, i < n ? str.slice(i * CHUNK, (i + 1) * CHUNK) : undefined);
+    }
+    player.setDynamicProperty(`ln:${key}:n`, n);
+    player.setDynamicProperty(`ln:${key}:night`, rec ? rec.night : undefined);
+    player.setDynamicProperty(`ln:${key}:b`, rec ? rec.breaks.slice(-300).map((b) => b.join(",")).join("|") : undefined);
+  } catch { }
 }
 
-function hasStalker(player) {
-  for (const s of stalkers.values()) if (s.targetId === player.id) return true;
-  return false;
+function load(player, key) {
+  try {
+    const night = player.getDynamicProperty(`ln:${key}:night`);
+    if (night === undefined) return null;
+    const n = Number(player.getDynamicProperty(`ln:${key}:n`) ?? 0);
+    let str = "";
+    for (let i = 0; i < n; i++) str += player.getDynamicProperty(`ln:${key}:${i}`) ?? "";
+    return decode(Number(night), str, player.getDynamicProperty(`ln:${key}:b`));
+  } catch { return null; }
 }
 
-// ---------- spawning / removal ----------
+// --------------------------------------------------------------- replay
 
-function spawnFor(player, forced = false) {
-  if (player.dimension.id !== "minecraft:overworld" && !forced) return false;
-  const view = player.getViewDirection();
-  const back = Math.atan2(-view.z, -view.x);
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const ang = back + rand(-1.0, 1.0);
-    const r = rand(CFG.spawnDistMin, CFG.spawnDistMax);
-    const x = player.location.x + Math.cos(ang) * r;
-    const z = player.location.z + Math.sin(ang) * r;
-    const spot = findGround(player.dimension, x, z, player.location.y + 4, 20);
-    if (!spot) continue;
-    try {
-      const h = player.dimension.spawnEntity(ID, spot);
-      h.teleport(spot, { facingLocation: player.location });
-      stalkers.set(h.id, { targetId: player.id, seen: 0, unseen: 0, spotted: false, attacking: false, manual: forced });
-      return true;
-    } catch { return false; }
-  }
-  return false;
+function startReplay(player, st, rec, clock, isTest = false) {
+  endReplay(st, false);
+  if (!rec || sampleCount(rec) < 12) return;
+  const now = clock();
+  const idx = rec.samples.map((s, i) => (s ? i : -1)).filter((i) => i >= 0);
+  const dusk = rec.samples[idx[0]];
+  st.replay = {
+    rec, clock, isTest,
+    entity: undefined,
+    lastKnown: undefined,
+    prev: undefined,
+    walk: 0,
+    swingUntil: 0,
+    touch: 0,
+    frozen: false,
+    lastSlot: idx[idx.length - 1],
+    dusk: { x: dusk[0] / 10, y: dusk[1] / 10, z: dusk[2] / 10 },
+    nextBreak: rec.breaks.findIndex((b) => b[0] >= now),
+    glitchAt: !isTest && getNights() >= 3 && Math.random() < 0.5
+      ? idx[Math.floor(Math.random() * idx.length)] : -1,
+    glitched: false,
+  };
+  if (st.replay.nextBreak < 0) st.replay.nextBreak = rec.breaks.length;
 }
 
-function vanish(hollow, player, loud = false) {
-  const s = stalkers.get(hollow.id);
-  stalkers.delete(hollow.id);
-  if (player) {
-    pstate(player).cooldownUntil = system.currentTick + CFG.cooldownAfterEncounter;
-    sound(player, loud ? "mob.endermen.portal" : "ambient.cave", { location: hollow.location, volume: loud ? 1 : 0.6, pitch: 0.5 });
+function endReplay(st, fade = true) {
+  const r = st.replay;
+  st.replay = undefined;
+  if (!r || !valid(r.entity)) return;
+  if (fade) {
+    for (let i = 0; i < 6; i++) {
+      try {
+        r.entity.dimension.spawnParticle("minecraft:basic_smoke_particle",
+          { x: r.entity.location.x + Math.random() - 0.5, y: r.entity.location.y + Math.random() * 1.8, z: r.entity.location.z + Math.random() - 0.5 });
+      } catch { }
+    }
   }
-  if (valid(hollow)) {
-    particles(hollow.dimension, hollow.location);
-    try { hollow.remove(); } catch { }
-  }
-  return s;
+  try { r.entity.remove(); } catch { }
 }
 
-// ---------- the scare ----------
+function positionAt(r, slot) {
+  const i = Math.floor(slot);
+  const a = r.rec.samples[i];
+  if (!a) return r.lastKnown; // gap (logged off, other dimension): it waits where you left
+  const b = r.rec.samples[i + 1];
+  const t = b ? slot - i : 0;
+  const B = b ?? a;
+  const pos = {
+    x: (a[0] + (B[0] - a[0]) * t) / 10,
+    y: (a[1] + (B[1] - a[1]) * t) / 10,
+    z: (a[2] + (B[2] - a[2]) * t) / 10,
+    p: a[3] + (B[3] - a[3]) * t,
+    w: lerpAngle(a[4], B[4], t),
+  };
+  r.lastKnown = pos;
+  return pos;
+}
 
-function jumpscare(hollow, player, state) {
-  state.attacking = true;
-  const eye = player.getHeadLocation();
-  const v = player.getViewDirection();
-  // put it right in front of the player's face
-  const loc = { x: eye.x + v.x * 1.3, y: player.location.y - 0.4, z: eye.z + v.z * 1.3 };
-  try { hollow.teleport(loc, { facingLocation: eye }); } catch { }
-  sound(player, "mob.endermen.stare", { volume: 1.0, pitch: 0.6 });
-  sound(player, "mob.warden.roar", { volume: 0.8, pitch: 1.6 });
-  try { player.addEffect("darkness", 120, { amplifier: 0, showParticles: false }); } catch { }
-  try { player.addEffect("nausea", 160, { amplifier: 0, showParticles: false }); } catch { }
-  try { player.addEffect("slowness", 40, { amplifier: 3, showParticles: false }); } catch { }
-  run(player, "camerashake add @s 0.6 1.2 positional");
-  try { player.onScreenDisplay.setTitle("§4§l ", { subtitle: "§8found you", fadeInDuration: 0, stayDuration: 20, fadeOutDuration: 10 }); } catch { }
+function desync(player, st) {
+  const r = st.replay;
+  r.frozen = true;
+  const echo = r.entity;
+  setProp(echo, "lastnight:walk", 0);
+  setProp(echo, "lastnight:swing", false);
+  place(echo, echo.location, player.getHeadLocation());
+  try { player.playSound("mob.endermen.portal", { volume: 1, pitch: 0.4 }); } catch { }
+  try { player.playSound("random.orb", { volume: 0.6, pitch: 0.1 }); } catch { }
+  try { player.addEffect("darkness", 100, { amplifier: 0, showParticles: false }); } catch { }
+  try { player.addEffect("nausea", 140, { amplifier: 0, showParticles: false }); } catch { }
+  try { player.onScreenDisplay.setTitle("§0.", { subtitle: "§8§oyou weren't supposed to be here yet", fadeInDuration: 0, stayDuration: 30, fadeOutDuration: 20 }); } catch { }
+
   system.runTimeout(() => {
-    try { player.applyDamage(CFG.jumpscareDamage); } catch { }
-  }, 6);
-  system.runTimeout(() => { if (valid(hollow)) vanish(hollow, player, true); }, 18);
-}
-
-// ---------- per-tick logic ----------
-
-function creepCloser(hollow, player) {
-  const to = sub(player.location, hollow.location);
-  const flat = norm({ x: to.x, y: 0, z: to.z });
-  const step = Math.min(CFG.creepStep, len(to) - 2);
-  const nx = hollow.location.x + flat.x * step + rand(-1.5, 1.5);
-  const nz = hollow.location.z + flat.z * step + rand(-1.5, 1.5);
-  const spot = findGround(hollow.dimension, nx, nz, hollow.location.y + 1, 8);
-  if (!spot) return;
-  try { hollow.teleport(spot, { facingLocation: player.getHeadLocation() }); } catch { }
-  // a single quiet footstep behind you
-  if (Math.random() < 0.6) sound(player, "step.gravel", { location: spot, volume: 0.5, pitch: 0.6 });
-}
-
-function updateStalker(hollow, state) {
-  const player = world.getAllPlayers().find((p) => p.id === state.targetId);
-  if (!player || !valid(player) || player.dimension.id !== hollow.dimension.id) return vanish(hollow);
-  if (state.attacking) return;
-  if (!isNight() && !state.manual) return vanish(hollow, player);
-
-  const { onScreen, staring, dist } = viewState(player, hollow);
-  if (dist > 90) return vanish(hollow, player);
-
-  if (onScreen) {
-    state.unseen = 0;
-    if (!state.spotted) {
-      state.spotted = true;
-      sound(player, "mob.warden.heartbeat", { volume: 1.0, pitch: 0.7 });
-    }
-    if (staring) {
-      state.seen++;
-      if (state.seen === 3) sound(player, "mob.warden.heartbeat", { volume: 1.0, pitch: 0.9 });
-      if (state.seen >= CFG.stareToBanish) {
-        try { player.onScreenDisplay.setActionBar("§8§o...not yet."); } catch { }
-        return vanish(hollow, player);
-      }
+    if (!valid(player)) return;
+    const dest = findGround(overworld(), r.dusk.x, r.dusk.z, r.dusk.y);
+    if (dest && player.dimension.id === "minecraft:overworld") {
+      try { player.teleport(dest); } catch { }
+      try { player.playSound("mob.endermen.portal", { volume: 1, pitch: 0.4 }); } catch { }
+      try { player.onScreenDisplay.setActionBar("§8§othis is where you were when it got dark."); } catch { }
+      // your past stays where you were, staring at where you went
+      if (valid(echo)) place(echo, echo.location, dest);
     } else {
-      state.seen = Math.max(0, state.seen - 1);
+      try { player.onScreenDisplay.setActionBar("§8§o...almost."); } catch { }
     }
+  }, 30);
+}
+
+function updateReplay(player, st, tick) {
+  const r = st.replay;
+  if (r.frozen) return;
+  const slot = r.clock();
+  if (r.isTest && slot > r.lastSlot + 10) return endReplay(st);
+
+  // the glitch: once, for six seconds, it stops remembering and looks at you
+  if (r.glitchAt >= 0 && slot >= r.glitchAt && slot < r.glitchAt + 12 && valid(r.entity)) {
+    if (!r.glitched) {
+      r.glitched = true;
+      setProp(r.entity, "lastnight:walk", 0);
+      soundNear(r.entity.dimension, r.entity.location, "ambient.cave", { volume: 0.7, pitch: 0.5 }, 64);
+    }
+    place(r.entity, r.entity.location, player.getHeadLocation());
     return;
   }
 
-  // not on screen -> it moves
-  state.seen = 0;
-  state.unseen++;
-  if (dist <= CFG.attackRange) return jumpscare(hollow, player, state);
-  if (state.unseen % CFG.creepEvery === 0) creepCloser(hollow, player);
+  const pos = positionAt(r, slot);
+  if (!pos) return;
+  const dim = overworld();
+  if (!valid(r.entity)) {
+    try {
+      r.entity = dim.spawnEntity(ECHO, pos);
+    } catch { return; } // chunk not loaded: it's out there somewhere anyway
+  }
+  const e = r.entity;
+  place(e, pos);
+
+  // walk animation from real displacement
+  const moved = r.prev ? Math.hypot(pos.x - r.prev.x, pos.z - r.prev.z) : 0;
+  r.prev = pos;
+  const target = Math.min(1, moved / 0.17);
+  const w = r.walk * 0.6 + target * 0.4;
+  if (Math.abs(w - r.walk) > 0.04 || (w < 0.05 && r.walk !== 0)) {
+    r.walk = w < 0.05 ? 0 : w;
+    setProp(e, "lastnight:walk", r.walk);
+  }
+  if (r.walk > 0.5 && tick % 8 === 0) soundNear(dim, pos, "step.stone", { volume: 0.35, pitch: 0.8 }, 24);
+
+  // the sounds of you, mining, last night
+  while (r.nextBreak < r.rec.breaks.length && r.rec.breaks[r.nextBreak][0] <= slot) {
+    const [, bx, by, bz, kind] = r.rec.breaks[r.nextBreak++];
+    soundNear(dim, { x: bx + 0.5, y: by + 0.5, z: bz + 0.5 }, digSound(kind), { volume: 1, pitch: 0.75 }, 56);
+    setProp(e, "lastnight:swing", true);
+    r.swingUntil = tick + 10;
+  }
+  if (r.swingUntil && tick >= r.swingUntil) { r.swingUntil = 0; setProp(e, "lastnight:swing", false); }
+
+  // crossing paths with yourself
+  if (player.dimension.id !== dim.id) return;
+  const d = dist(player.location, e.location);
+  if (!st.warned && d < 8) {
+    st.warned = true;
+    try { player.setDynamicProperty("ln:warned", true); } catch { }
+    try { player.onScreenDisplay.setActionBar("§7§odon't be where you were."); } catch { }
+  }
+  if (d < TOUCH_DIST) {
+    if (++r.touch >= TOUCH_TICKS) desync(player, st);
+  } else r.touch = 0;
 }
 
-function ambientScare(player) {
-  const roll = Math.random();
-  const v = player.getViewDirection();
-  const behind = { x: player.location.x - v.x * 3, y: player.location.y, z: player.location.z - v.z * 3 };
-  if (roll < 0.35) {
-    // footsteps that follow you
-    for (let i = 0; i < 4; i++) {
-      system.runTimeout(() => {
-        if (!valid(player)) return;
-        const vv = player.getViewDirection();
-        const loc = { x: player.location.x - vv.x * (4 - i * 0.6), y: player.location.y, z: player.location.z - vv.z * (4 - i * 0.6) };
-        sound(player, "step.grass", { location: loc, volume: 0.8, pitch: 0.8 });
-      }, i * 9);
-    }
-  } else if (roll < 0.65) {
-    try { player.onScreenDisplay.setActionBar(pick(WHISPERS)); } catch { }
-    sound(player, "ambient.soulsand_valley.mood", { location: behind, volume: 0.8, pitch: 0.6 });
-  } else if (roll < 0.85) {
-    sound(player, "ambient.cave", { location: behind, volume: 1.0, pitch: 0.8 });
-  } else {
-    sound(player, "random.door_close", { location: behind, volume: 0.6, pitch: 0.7 });
+// ---------------------------------------------------------- night cycle
+
+function beginNight(player, st, announce) {
+  const nights = getNights();
+  const cur = st.rec ?? load(player, "cur");
+  if (cur && cur.night !== nights && sampleCount(cur) >= 12) {
+    st.past = cur;
+    save(player, "past", cur);
+  } else if (!st.past) {
+    st.past = load(player, "past");
+  }
+  st.rec = cur && cur.night === nights ? cur : newRec(nights);
+  if (st.past) startReplay(player, st, st.past, nightSlot);
+  if (announce) {
+    system.runTimeout(() => {
+      try {
+        player.onScreenDisplay.setActionBar(st.past ? "§8§olast night is happening again." : "§8§osomething is taking notes.");
+      } catch { }
+    }, 60);
   }
 }
+
+function endNight(player, st) {
+  if (st.rec) save(player, "cur", st.rec);
+  endReplay(st);
+}
+
+function stateFor(player) {
+  let st = states.get(player.id);
+  if (!st) {
+    st = { rec: undefined, past: undefined, replay: undefined, ring: [], warned: !!player.getDynamicProperty("ln:warned") };
+    states.set(player.id, st);
+    if (isNight() && world.getDynamicProperty("ln:inNight")) beginNight(player, st, false);
+  }
+  return st;
+}
+
+// ------------------------------------------------------------ main loop
 
 system.runInterval(() => {
-  const now = system.currentTick;
+  const tick = system.currentTick;
+  const night = isNight();
+  const wasNight = !!world.getDynamicProperty("ln:inNight");
 
-  // clean up orphans (e.g. after a world reload) and update live stalkers
-  const alive = new Set();
-  for (const dimId of ["overworld", "nether", "the_end"]) {
-    let list = [];
-    try { list = world.getDimension(dimId).getEntities({ type: ID }); } catch { }
-    for (const h of list) {
-      const s = stalkers.get(h.id);
-      if (!s) { try { h.remove(); } catch { } continue; }
-      alive.add(h.id);
-      try { updateStalker(h, s); } catch { }
-    }
+  if (night && !wasNight) {
+    world.setDynamicProperty("ln:nights", getNights() + 1);
+    world.setDynamicProperty("ln:inNight", true);
+    for (const p of world.getAllPlayers()) beginNight(p, stateFor(p), true);
+  } else if (!night && wasNight) {
+    world.setDynamicProperty("ln:inNight", false);
+    for (const p of world.getAllPlayers()) endNight(p, stateFor(p));
   }
-  // forget stalkers whose entity is gone (unloaded chunk etc.)
-  for (const [id, s] of stalkers) if (!alive.has(id) && !s.attacking) stalkers.delete(id);
 
-  if (!isNight()) return;
   for (const player of world.getAllPlayers()) {
-    const s = pstate(player);
-    if (now >= s.nextAmbient) {
-      s.nextAmbient = now + rand(CFG.ambientMin, CFG.ambientMax);
-      ambientScare(player);
+    const st = stateFor(player);
+    const inOverworld = player.dimension.id === "minecraft:overworld";
+
+    if (tick % SAMPLE === 0 && inOverworld) {
+      const l = player.location, rot = player.getRotation();
+      const s = [r1(l.x), r1(l.y), r1(l.z), Math.round(rot.x), Math.round(rot.y)];
+      st.ring.push({ s, breaks: [] });
+      if (st.ring.length > RING_SIZE) st.ring.shift();
+      if (night && st.rec) {
+        const slot = Math.floor(nightSlot());
+        if (slot >= 0 && slot < SLOTS) st.rec.samples[slot] = s;
+      }
     }
-    if (now >= s.nextSpawnRoll) {
-      s.nextSpawnRoll = now + CFG.spawnCheckEvery;
-      if (now >= s.cooldownUntil && !hasStalker(player) && Math.random() < CFG.spawnChance) spawnFor(player);
+    if (night && st.rec && tick % 600 === 0) save(player, "cur", st.rec);
+
+    if (st.replay) {
+      try { updateReplay(player, st, tick); } catch { }
     }
   }
-}, TICK_RATE);
 
-// Hitting it doesn't hurt it. It just leaves, and it isn't happy about it.
+  // clean up any echo nobody is remembering anymore
+  if (tick % 100 === 0) {
+    const live = new Set();
+    for (const st of states.values()) if (st.replay && valid(st.replay.entity)) live.add(st.replay.entity.id);
+    try {
+      for (const e of overworld().getEntities({ type: ECHO })) if (!live.has(e.id)) e.remove();
+    } catch { }
+  }
+}, 2);
+
+// ---------------------------------------------------------------- events
+
+world.afterEvents.playerBreakBlock.subscribe(({ player, block, brokenBlockPermutation }) => {
+  const st = states.get(player.id);
+  if (!st || player.dimension.id !== "minecraft:overworld") return;
+  const kind = (brokenBlockPermutation?.type?.id ?? "stone").replace("minecraft:", "");
+  const { x, y, z } = block.location;
+  if (isNight() && st.rec) st.rec.breaks.push([Math.floor(nightSlot()), x, y, z, kind]);
+  const last = st.ring[st.ring.length - 1];
+  if (last) last.breaks.push([x, y, z, kind]);
+});
+
+// It's you. Of course it hurts.
 world.afterEvents.entityHitEntity.subscribe(({ damagingEntity, hitEntity }) => {
-  if (hitEntity?.typeId !== ID || damagingEntity?.typeId !== "minecraft:player") return;
-  try { damagingEntity.addEffect("blindness", 50, { amplifier: 0, showParticles: false }); } catch { }
-  vanish(hitEntity, damagingEntity, true);
+  if (hitEntity?.typeId !== ECHO || damagingEntity?.typeId !== "minecraft:player") return;
+  try { damagingEntity.applyDamage(3); } catch { }
+  try { damagingEntity.playSound("game.player.hurt", { volume: 1, pitch: 0.7 }); } catch { }
+  try { damagingEntity.onScreenDisplay.setActionBar("§8§oit hurt. why did it hurt?"); } catch { }
 });
 
-// Spawn eggs / /summon: adopt the nearest player as the target.
-world.afterEvents.entitySpawn.subscribe(({ entity }) => {
-  if (entity?.typeId !== ID || stalkers.has(entity.id)) return;
-  system.runTimeout(() => {
-    if (!valid(entity) || stalkers.has(entity.id)) return;
-    let best, bestD = Infinity;
-    for (const p of entity.dimension.getPlayers()) {
-      const d = len(sub(p.location, entity.location));
-      if (d < bestD) { bestD = d; best = p; }
-    }
-    if (best) stalkers.set(entity.id, { targetId: best.id, seen: 0, unseen: 0, spotted: false, attacking: false, manual: true });
-    else try { entity.remove(); } catch { }
-  }, 1);
+world.afterEvents.playerLeave.subscribe(({ playerId }) => {
+  const st = states.get(playerId);
+  if (st) endReplay(st, false);
+  states.delete(playerId);
 });
 
-// First join greeting
 world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
-  if (!initialSpawn) return;
+  if (!initialSpawn || player.getDynamicProperty("ln:greeted")) return;
   system.runTimeout(() => {
-    try { player.sendMessage("§8You feel like you're being watched."); } catch { }
-  }, 100);
+    try {
+      player.setDynamicProperty("ln:greeted", true);
+      player.sendMessage("§8§oRemember what you do tonight. Something else will.");
+    } catch { }
+  }, 120);
 });
 
-// Testing: /scriptevent hollow:summon
-system.afterEvents?.scriptEventReceive?.subscribe(({ id, sourceEntity }) => {
-  if (id !== "hollow:summon" || sourceEntity?.typeId !== "minecraft:player") return;
-  if (!spawnFor(sourceEntity, true)) sourceEntity.sendMessage("§cNo place for it to stand. It will find one later.");
+// Testing: /scriptevent lastnight:test  -> replays your last 2 minutes, starting now
+system.afterEvents?.scriptEventReceive?.subscribe(({ id, sourceEntity: player }) => {
+  if (id !== "lastnight:test" || player?.typeId !== "minecraft:player") return;
+  const st = stateFor(player);
+  if (st.ring.length < 12) {
+    player.sendMessage("§7Walk around for a bit first, then try again.");
+    return;
+  }
+  const rec = { night: -1, samples: st.ring.map((e) => e.s), breaks: [] };
+  st.ring.forEach((e, i) => e.breaks.forEach((b) => rec.breaks.push([i, ...b])));
+  const start = system.currentTick;
+  startReplay(player, st, rec, () => (system.currentTick - start) / SAMPLE, true);
+  player.sendMessage("§7Replaying your last two minutes. Go stand somewhere you stood.");
 });

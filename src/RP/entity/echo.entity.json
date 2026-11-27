@@ -1,0 +1,14 @@
+{
+  "format_version": "1.10.0",
+  "minecraft:client_entity": {
+    "description": {
+      "identifier": "lastnight:echo",
+      "materials": { "default": "entity_alphablend" },
+      "textures": { "default": "textures/entity/echo" },
+      "geometry": { "default": "geometry.lastnight.echo" },
+      "animations": { "move": "animation.lastnight.echo.move" },
+      "scripts": { "animate": ["move"] },
+      "render_controllers": ["controller.render.default"]
+    }
+  }
+}

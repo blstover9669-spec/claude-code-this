@@ -1,4 +1,3 @@
-pack.name=The Hollow
-pack.description=Something pale watches from the treeline. Don't look away.
-entity.hollow:watcher.name=The Hollow
-item.spawn_egg.entity.hollow:watcher.name=Spawn The Hollow
+pack.name=Last Night
+pack.description=Everything you do after dark is remembered. Tomorrow night, it happens again.
+entity.lastnight:echo.name=You
