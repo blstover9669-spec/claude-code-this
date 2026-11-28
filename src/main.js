@@ -188,13 +188,13 @@ async function boot() {
     vrBtn.textContent = 'VR needs HTTPS';
     note.textContent = 'WebXR only works on https:// pages. Open the hosted link in your Quest browser.';
   } else if (!navigator.xr) {
-    vrBtn.textContent = 'VR not available here';
-    note.textContent = 'Open this page in the Meta Quest Browser to play in VR — or try it on desktop.';
+    vrBtn.textContent = 'Open me on your Quest';
+    note.textContent = 'This is a Quest VR game. Open this link in the Meta Quest Browser on your headset to play with both hands. Desktop mode is only a preview.';
   } else {
     navigator.xr.isSessionSupported('immersive-vr').then((ok) => {
       if (ok) { vrBtn.disabled = false; vrBtn.textContent = 'ENTER VR'; note.textContent = ''; }
-      else { vrBtn.textContent = 'No headset found'; note.textContent = 'Open this page in the Meta Quest Browser to play in VR — or try it on desktop.'; }
-    }).catch(() => { vrBtn.textContent = 'VR not available here'; });
+      else { vrBtn.textContent = 'Open me on your Quest'; note.textContent = 'This is a Quest VR game. Open this link in the Meta Quest Browser on your headset to play with both hands. Desktop mode is only a preview.'; }
+    }).catch(() => { vrBtn.textContent = 'Open me on your Quest'; });
   }
 
   // ---------------------------------------------------------- main loop

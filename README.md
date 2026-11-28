@@ -12,7 +12,9 @@ https://raw.githack.com/blstover9669-spec/claude-code-this/claude/wonderful-brah
 
 The first time, githack shows a one-off "External Content Notice". Tap **Open the page** to continue.
 
-**On a computer:** open the same link and press **Play on desktop**.
+This runs on the headset itself, with no PC involved. Both arms are tracked by your two Touch controllers, just like any other Quest game.
+
+**On a computer:** open the same link and press **Desktop preview**. It's a keyboard-and-mouse preview for people without a headset, not the real thing.
 
 **Shorter link (optional):** in the repo, go to *Settings → Pages*, choose *Deploy from a branch*, select this branch and `/ (root)`, then save. The game will then be at `https://blstover9669-spec.github.io/claude-code-this/`.
 
