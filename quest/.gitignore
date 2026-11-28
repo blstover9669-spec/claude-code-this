@@ -1,0 +1,7 @@
+.godot/
+android/
+build/
+# fetched by tools/build_apk.sh (Godot OpenXR vendors plugin 4.0.0)
+addons/
+*.keystore
+*.tmp

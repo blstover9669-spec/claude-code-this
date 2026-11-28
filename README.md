@@ -6,6 +6,21 @@ You have no legs, only hands. Your hands are solid: push against the ground, tru
 
 ## Play it
 
+### Native Quest app (APK)
+
+[Download ShroomScramble-quest.apk](https://github.com/blstover9669-spec/claude-code-this/raw/claude/wonderful-brahmagupta-z9wixs/releases/ShroomScramble-quest.apk) (31 MB). It's a standalone native build: Godot 4.4 with OpenXR. It launches straight into VR, needs no browser and works offline. Your hands follow the Touch controllers' grip pose.
+
+To sideload it:
+
+1. Turn on **developer mode** for your headset in the Meta Horizon phone app (Menu → Devices → your headset → Headset settings → Developer mode). This requires a free Meta developer account.
+2. Plug the Quest into a computer and accept the "Allow USB debugging" prompt inside the headset.
+3. Install the APK, either by dragging it onto [SideQuest](https://sidequestvr.com/) or with `adb install -r ShroomScramble-quest.apk`.
+4. In the headset, open your app library, switch the filter to **Unknown Sources**, and launch **Shroom Scramble**.
+
+The Godot project lives in `quest/`. It's a port of the web version: the same level, colliders, bot nav graph and sounds are exported from the web build with `tools/export_godot_data.js`, and the same physics tests pass with identical numbers. To rebuild, run `tools/build_apk.sh` (it needs Godot 4.4.1, its export templates, JDK 17 and the Android SDK).
+
+### Web version (no install)
+
 **On a Quest:** open this link in the Meta Quest Browser and press **ENTER VR**:
 
 https://raw.githack.com/blstover9669-spec/claude-code-this/claude/wonderful-brahmagupta-z9wixs/index.html
