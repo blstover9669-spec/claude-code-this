@@ -10,7 +10,11 @@ You have no legs, only hands. Your hands are solid: push against the ground, tru
 
 https://raw.githack.com/blstover9669-spec/claude-code-this/claude/wonderful-brahmagupta-z9wixs/index.html
 
+The first time, githack shows a one-off "External Content Notice". Tap **Open the page** to continue.
+
 **On a computer:** open the same link and press **Play on desktop**.
+
+**Shorter link (optional):** in the repo, go to *Settings → Pages*, choose *Deploy from a branch*, select this branch and `/ (root)`, then save. The game will then be at `https://blstover9669-spec.github.io/claude-code-this/`.
 
 ## How to move (VR)
 
