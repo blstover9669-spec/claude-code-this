@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Shroom Scramble</title>
+  <meta name="description" content="Arm-powered tag on floating mushroom islands. A WebXR game for Meta Quest (and desktop)." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #fff7ec;
+      --ink-dim: #e3d4ff;
+      --panel: rgba(30, 17, 58, 0.8);
+      --edge: rgba(255, 255, 255, 0.16);
+      --warm: #ffb347;
+      --cool: #7bdff2;
+      --gold: #ffd166;
+      --bg: #2a1a4a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--ink); font-family: 'Fredoka', system-ui, sans-serif; }
+    #app canvas { display: block; }
+    .hidden { display: none !important; }
+    #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px;
+      background: radial-gradient(ellipse at 50% 40%, rgba(25, 12, 50, 0) 0%, rgba(25, 12, 50, 0.55) 100%); }
+    .card { width: min(540px, 100%); max-height: calc(100% - 8px); overflow: auto; background: var(--panel); border: 1px solid var(--edge);
+      border-radius: 26px; padding: 26px 26px 20px; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); box-shadow: 0 24px 70px rgba(10, 4, 30, 0.45); }
+    h1 { margin: 0; font-size: clamp(40px, 10vw, 62px); line-height: 0.92; letter-spacing: 0.5px; font-weight: 700; }
+    h1 .a { color: var(--warm); text-shadow: 0 4px 0 #a0441f; }
+    h1 .b { color: var(--cool); text-shadow: 0 4px 0 #2b6f86; }
+    .sub { margin: 12px 0 18px; color: var(--ink-dim); font-size: 18px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    button { font: inherit; font-weight: 600; font-size: 19px; border: 0; border-radius: 16px; padding: 14px 20px; cursor: pointer; transition: transform 0.08s ease, filter 0.15s; }
+    button:active { transform: translateY(2px); }
+    button:disabled { cursor: default; filter: grayscale(0.7) brightness(0.8); }
+    #enter-vr { flex: 1 1 220px; background: var(--gold); color: #2a1640; box-shadow: 0 5px 0 #b8862b; }
+    #play-desktop { flex: 1 1 180px; background: rgba(255, 255, 255, 0.12); color: var(--ink); box-shadow: inset 0 0 0 1px var(--edge); }
+    .note { min-height: 1.2em; margin: 12px 0 0; color: #ffcf9e; font-size: 15px; }
+    details { margin-top: 14px; border-top: 1px solid var(--edge); padding-top: 12px; }
+    summary { cursor: pointer; font-weight: 600; color: var(--ink); }
+    .how { color: var(--ink-dim); font-size: 15px; line-height: 1.45; }
+    .how b { color: var(--ink); }
+    .how ul { margin: 8px 0; padding-left: 20px; }
+    #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; text-align: center;
+      font-size: 22px; color: var(--ink-dim); background: var(--bg); }
+    #desk-hud { position: fixed; inset: 0; pointer-events: none; }
+    .crosshair { position: absolute; left: 50%; top: 50%; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.9); box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); }
+    .keys { position: absolute; left: 16px; bottom: 16px; right: 16px; font-size: 14px; color: rgba(255, 247, 236, 0.85);
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6); }
+    .keys kbd { font: inherit; font-weight: 600; background: rgba(30, 17, 58, 0.7); border: 1px solid var(--edge); border-radius: 6px; padding: 1px 6px; }
+    #exit-desktop { pointer-events: auto; position: absolute; top: 14px; right: 14px; font-size: 14px; padding: 8px 12px; border-radius: 12px;
+      background: rgba(30, 17, 58, 0.75); color: var(--ink); box-shadow: inset 0 0 0 1px var(--edge); }
+    #lock-hint { pointer-events: auto; position: absolute; left: 50%; top: 58%; transform: translateX(-50%); background: rgba(30, 17, 58, 0.82);
+      border: 1px solid var(--edge); border-radius: 14px; padding: 10px 16px; font-size: 17px; cursor: pointer; white-space: nowrap; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="overlay" class="hidden">
+    <div class="card">
+      <h1><span class="a">SHROOM</span><br /><span class="b">SCRAMBLE</span></h1>
+      <p class="sub">Arm-powered tag on floating mushroom islands. No legs — just your hands.</p>
+      <div class="actions">
+        <button id="enter-vr" disabled>Checking for VR…</button>
+        <button id="play-desktop">Play on desktop</button>
+      </div>
+      <p id="vr-note" class="note"></p>
+      <details>
+        <summary>How to play</summary>
+        <div class="how">
+          <p><b>In VR:</b> your hands are solid. Push against the ground, walls or mushrooms to move your body, and let go mid-swing to fling yourself. Swing both arms back along the ground to run; slam down and release to jump; pull down on trunks to climb.</p>
+          <ul>
+            <li><b>Pink spotted caps</b> are bouncy — slap them to launch.</li>
+            <li><b>Crystals</b> are slippery. <b>Clouds</b> are soft and climbable.</li>
+            <li>Punch the buttons on the wooden console to pick a mode, bots and difficulty.</li>
+            <li>Right thumbstick: snap turn (toggle it on the console).</li>
+          </ul>
+          <p><b>Modes:</b> Tag · Spore Tag (infection) · Orb Rush · Lava Rise.</p>
+          <p><b>Desktop:</b> WASD move · mouse look · Space jump · Shift sprint · hold W against a wall to climb · click to slap / press buttons · Enter start/stop · Q/E change mode · M menu.</p>
+        </div>
+      </details>
+    </div>
+  </div>
+  <div id="desk-hud" class="hidden">
+    <div class="crosshair"></div>
+    <button id="exit-desktop">Menu (M)</button>
+    <div id="lock-hint" class="hidden">Click to look around</div>
+    <div class="keys"><kbd>WASD</kbd> move · <kbd>Space</kbd> jump · <kbd>Shift</kbd> sprint · hold <kbd>W</kbd> on walls to climb · <kbd>Click</kbd> slap / press · <kbd>Enter</kbd> start · <kbd>Q</kbd>/<kbd>E</kbd> mode</div>
+  </div>
+  <div id="loading">Growing mushrooms…</div>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
